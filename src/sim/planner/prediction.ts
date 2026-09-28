@@ -20,12 +20,22 @@ export interface Prediction {
  */
 export class Predictor {
   private readonly lastV = new Map<number, { v: number; t: number; a: number }>();
+  private readonly stillSince = new Map<number, number>();
+
+  /** Seconds the agent has been observed stationary. */
+  stationaryFor(id: number, t: number): number {
+    const since = this.stillSince.get(id);
+    return since === undefined ? 0 : t - since;
+  }
 
   constructor(private readonly net: RoadNetwork) {}
 
   /** Estimated longitudinal acceleration of each agent, from successive speed observations. */
   observe(agents: readonly Agent[], t: number): void {
     for (const a of agents) {
+      if (a.v < 0.2) {
+        if (!this.stillSince.has(a.id)) this.stillSince.set(a.id, t);
+      } else this.stillSince.delete(a.id);
       const prev = this.lastV.get(a.id);
       if (prev && t > prev.t) {
         const raw = (a.v - prev.v) / (t - prev.t);
@@ -35,6 +45,7 @@ export class Predictor {
     if (this.lastV.size > 2000) {
       const live = new Set(agents.map((a) => a.id));
       for (const id of this.lastV.keys()) if (!live.has(id)) this.lastV.delete(id);
+      for (const id of this.stillSince.keys()) if (!live.has(id)) this.stillSince.delete(id);
     }
   }
 

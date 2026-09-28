@@ -1,119 +1,146 @@
 import type { Vec2 } from "../sim/geometry";
+import type { RoadNetwork } from "../sim/map/network";
 import type { Simulation } from "../sim/simulation";
-import { BLOCK, GRID, ROAD_HALF } from "../sim/world";
 
 export class Minimap {
   private readonly ctx: CanvasRenderingContext2D;
-  private readonly min = -BLOCK * 0.45;
-  private readonly span = (GRID - 1) * BLOCK + BLOCK * 0.9;
-  private size = 240;
+  private size = 244;
+  private base: HTMLCanvasElement | null = null;
+  private readonly minX: number;
+  private readonly minY: number;
+  private readonly span: number;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
+    private readonly net: RoadNetwork,
     onPick: (p: Vec2) => void,
   ) {
     const ctx = canvas.getContext("2d");
     if (!ctx) throw new Error("2D canvas unavailable");
     this.ctx = ctx;
+    const b = net.bounds;
+    this.span = Math.max(b.maxX - b.minX, b.maxY - b.minY) + 20;
+    this.minX = (b.minX + b.maxX) / 2 - this.span / 2;
+    this.minY = (b.minY + b.maxY) / 2 - this.span / 2;
     this.resize();
     canvas.addEventListener("click", (ev) => {
       const rect = canvas.getBoundingClientRect();
       const sx = ((ev.clientX - rect.left) / rect.width) * this.size;
       const sy = ((ev.clientY - rect.top) / rect.height) * this.size;
-      onPick({ x: this.min + (sx / this.size) * this.span, y: this.min + (sy / this.size) * this.span });
+      onPick({ x: this.minX + (sx / this.size) * this.span, y: this.minY + (sy / this.size) * this.span });
     });
   }
 
   resize(): void {
     const dpr = Math.min(window.devicePixelRatio, 2);
-    this.size = this.canvas.clientWidth || 240;
+    this.size = this.canvas.clientWidth || 244;
     this.canvas.width = this.size * dpr;
     this.canvas.height = this.size * dpr;
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.base = null;
   }
 
-  private px(v: number): number {
-    return ((v - this.min) / this.span) * this.size;
+  private px(x: number): number {
+    return ((x - this.minX) / this.span) * this.size;
+  }
+  private py(y: number): number {
+    return ((y - this.minY) / this.span) * this.size;
   }
 
-  draw(sim: Simulation, wallTime: number): void {
-    const c = this.ctx;
-    const s = this.size;
-    c.clearRect(0, 0, s, s);
-    c.fillStyle = "#101216";
-    c.fillRect(0, 0, s, s);
-
-    const roadW = ((ROAD_HALF * 2) / this.span) * s;
-    c.strokeStyle = "#2e323a";
-    c.lineWidth = roadW;
-    c.lineCap = "square";
-    const end = (GRID - 1) * BLOCK;
-    for (let k = 0; k < GRID; k++) {
-      const p = this.px(k * BLOCK);
-      c.beginPath();
-      c.moveTo(this.px(0), p);
-      c.lineTo(this.px(end), p);
-      c.moveTo(p, this.px(0));
-      c.lineTo(p, this.px(end));
-      c.stroke();
+  private drawBase(): HTMLCanvasElement {
+    const dpr = Math.min(window.devicePixelRatio, 2);
+    const c = document.createElement("canvas");
+    c.width = this.size * dpr;
+    c.height = this.size * dpr;
+    const g = c.getContext("2d") as CanvasRenderingContext2D;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.fillStyle = "#101216";
+    g.fillRect(0, 0, this.size, this.size);
+    g.fillStyle = "#1d2027";
+    for (const b of this.net.buildings) {
+      g.beginPath();
+      b.pts.forEach((p, i) => (i === 0 ? g.moveTo(this.px(p.x), this.py(p.y)) : g.lineTo(this.px(p.x), this.py(p.y))));
+      g.closePath();
+      g.fill();
     }
+    g.fillStyle = "#1c2a20";
+    for (const p of this.net.parks) {
+      g.beginPath();
+      p.forEach((q, i) => (i === 0 ? g.moveTo(this.px(q.x), this.py(q.y)) : g.lineTo(this.px(q.x), this.py(q.y))));
+      g.closePath();
+      g.fill();
+    }
+    g.strokeStyle = "#3a3f49";
+    g.lineCap = "round";
+    for (const seg of this.net.segments) {
+      g.lineWidth = Math.max(1, ((seg.rightW + seg.leftW) / this.span) * this.size);
+      g.beginPath();
+      seg.center.pts.forEach((p, i) => (i === 0 ? g.moveTo(this.px(p.x), this.py(p.y)) : g.lineTo(this.px(p.x), this.py(p.y))));
+      g.stroke();
+    }
+    return c;
+  }
 
-    for (const n of sim.world.nodes) {
-      const ph = sim.world.phaseAt(n.id, sim.t).name;
-      const ew = ph.startsWith("EW") ? (ph.endsWith("_Y") ? "#ffc21a" : "#2cff7a") : "#ff3b3b";
-      const ns = ph.startsWith("NS") ? (ph.endsWith("_Y") ? "#ffc21a" : "#2cff7a") : "#ff3b3b";
-      const x = this.px(n.pos.x);
-      const y = this.px(n.pos.y);
-      c.fillStyle = ew;
-      c.fillRect(x - 3.5, y - 0.8, 7, 1.6);
-      c.fillStyle = ns;
-      c.fillRect(x - 0.8, y - 3.5, 1.6, 7);
+  draw(sim: Simulation, wall: number): void {
+    const c = this.ctx;
+    if (!this.base) this.base = this.drawBase();
+    c.clearRect(0, 0, this.size, this.size);
+    c.drawImage(this.base, 0, 0, this.size, this.size);
+
+    for (const ctrl of this.net.controllers) {
+      const j = ctrl.junctions[0];
+      const col = [0, 1].map((g) => this.net.signalColor(ctrl, g, sim.t));
+      c.fillStyle = col[0] === "G" ? "#2cff7a" : col[0] === "Y" ? "#ffc21a" : "#ff3b3b";
+      c.fillRect(this.px(j.pos.x) - 1.5, this.py(j.pos.y) - 1.5, 3, 3);
     }
 
     const ego = sim.ego;
-    if (ego.mode === "fsd" && ego.path) {
+    if (ego.mode === "fsd" && ego.ref && ego.plan) {
       c.strokeStyle = "#2f7bff";
-      c.lineWidth = 3;
-      c.lineCap = "round";
+      c.lineWidth = 2.5;
       c.lineJoin = "round";
       c.beginPath();
-      const stepS = 4;
-      for (let sArc = ego.pathS; sArc <= ego.destS; sArc += stepS) {
-        const p = ego.path.sampleAt(sArc).p;
-        if (sArc === ego.pathS) c.moveTo(this.px(p.x), this.px(p.y));
-        else c.lineTo(this.px(p.x), this.px(p.y));
+      const ref = ego.ref;
+      for (let s = ego.plan.s0, first = true; s <= ref.destS; s += 5, first = false) {
+        const p = ref.poly.sampleAt(s).p;
+        if (first) c.moveTo(this.px(p.x), this.py(p.y));
+        else c.lineTo(this.px(p.x), this.py(p.y));
       }
       c.stroke();
     }
-
-    for (const car of sim.traffic.cars) {
-      c.fillStyle = car.stalled ? "#e08a2c" : car.id === ego.leadId ? "#6f9bff" : "#8a909a";
+    if (ego.mode === "fsd" && ego.free) {
+      c.strokeStyle = "#35d6e8";
+      c.lineWidth = 2;
       c.beginPath();
-      c.arc(this.px(car.pos.x), this.px(car.pos.y), 1.9, 0, Math.PI * 2);
+      ego.free.path.forEach((p, i) => (i === 0 ? c.moveTo(this.px(p.x), this.py(p.y)) : c.lineTo(this.px(p.x), this.py(p.y))));
+      c.stroke();
+    }
+
+    for (const v of sim.traffic.vehicles) {
+      c.fillStyle = v.stalled ? "#e08a2c" : v.id === ego.leadId ? "#6f9bff" : v.vkind === "bus" || v.vkind === "truck" ? "#b7bcc6" : "#7d838d";
+      const r = v.vkind === "bike" || v.vkind === "moto" ? 0.9 : v.vkind === "bus" || v.vkind === "truck" ? 1.8 : 1.3;
+      c.beginPath();
+      c.arc(this.px(v.pos.x), this.py(v.pos.y), r, 0, Math.PI * 2);
       c.fill();
     }
     c.fillStyle = "#c3c7cf";
-    for (const p of sim.peds.peds) c.fillRect(this.px(p.pos.x) - 0.6, this.px(p.pos.y) - 0.6, 1.2, 1.2);
+    for (const p of sim.peds.peds) c.fillRect(this.px(p.pos.x) - 0.5, this.py(p.pos.y) - 0.5, 1, 1);
 
     if (ego.dest) {
       const x = this.px(ego.dest.pos.x);
-      const y = this.px(ego.dest.pos.y);
-      const r = 5 + Math.sin(wallTime * 3) * 1.2;
+      const y = this.py(ego.dest.pos.y);
       c.strokeStyle = "rgba(63,140,255,0.7)";
       c.lineWidth = 2;
       c.beginPath();
-      c.arc(x, y, r, 0, Math.PI * 2);
+      c.arc(x, y, 5 + Math.sin(wall * 3) * 1.2, 0, Math.PI * 2);
       c.stroke();
       c.fillStyle = "#3f8cff";
       c.beginPath();
-      c.arc(x, y, 2.6, 0, Math.PI * 2);
+      c.arc(x, y, 2.4, 0, Math.PI * 2);
       c.fill();
     }
-
-    const ex = this.px(ego.pos.x);
-    const ey = this.px(ego.pos.y);
     c.save();
-    c.translate(ex, ey);
+    c.translate(this.px(ego.pos.x), this.py(ego.pos.y));
     c.rotate(ego.heading);
     c.fillStyle = "#ffffff";
     c.strokeStyle = "#2f7bff";

@@ -3,7 +3,7 @@ import { Polyline, type Vec2, add, angleOf, clamp, cross, dist, dot, fromAngle, 
 import type { Connector, Lane, RoadNetwork } from "./map/network";
 import { type FreePathPoint, hybridAStar, splitByDirection } from "./planner/hybridAstar";
 import { LatticePlanner, type Plan } from "./planner/lattice";
-import { PRED_DT, type Predictor } from "./planner/prediction";
+import { PRED_DT, type Prediction, type Predictor } from "./planner/prediction";
 import { type Reference, buildReference } from "./planner/reference";
 import { type RouteStep, goalForPoint, planRoute } from "./planner/route";
 import type { EgoExposure, Occupant, Traffic } from "./traffic";
@@ -84,6 +84,7 @@ export class Ego implements Agent {
   ref: Reference | null = null;
   plan: Plan | null = null;
   planPath: Polyline | null = null;
+  lastPreds: Prediction[] = [];
   private planAge = 0;
   private planTimer = 0;
   private routeTimer = 0;
@@ -322,6 +323,7 @@ export class Ego implements Agent {
       this.noRouteTime = 0;
       const ref = this.ref;
       const preds = ctx.predictor.predict(ctx.agents, this.id, this.pos, 85);
+      this.lastPreds = preds;
       const plan = this.lattice.plan({
         ref,
         ego: { pos: this.pos, heading: this.heading, v: this.v, a: this.accel, length: this.length, width: this.width },
@@ -520,7 +522,8 @@ export class Ego implements Agent {
     // Hand back to lane driving once aligned with a lane in the direction of travel.
     const lastRun = m.run === m.runs.length - 1;
     const progressed = !this.freeAheadOnly || pr.s > run.poly.length * 0.65;
-    const loc = net.matchLane(this.pos, this.heading, 1.4, 0.3);
+    const found = net.matchLane(this.pos, this.heading, 1.4, 0.3);
+    const loc = found && found.lane.road !== this.freeExclude?.road ? found : null;
     if (loc && run.dir > 0 && lastRun && progressed) {
       this.fsd = "lane";
       this.free = null;
@@ -564,13 +567,28 @@ export class Ego implements Agent {
         break;
       }
     }
+    // Contact check on the actual pose a short distance ahead in the direction of motion.
+    if (!hazard) {
+      const ahead = { x: this.pos.x + Math.cos(this.heading) * 0.8 * run.dir, y: this.pos.y + Math.sin(this.heading) * 0.8 * run.dir };
+      const mine = footprint(ahead, this.heading, this.length, this.width);
+      for (const a of ctx.agents) {
+        if (a.id === this.id || dist(a.pos, this.pos) > 12) continue;
+        const ar = a.kind === "ped" ? 0.35 : a.width / 2;
+        const theirs = a.kind === "ped" ? [a.pos] : footprint(a.pos, a.heading, a.length, a.width);
+        if (mine.some((c) => theirs.some((q2) => dist(c, q2) < this.width / 2 + ar + 0.05))) {
+          hazard = true;
+          this.leadId = a.id;
+          break;
+        }
+      }
+    }
     const vMax = run.dir > 0 ? 2.8 : 1.6;
     const vTarget = hazard ? 0 : run.dir * Math.min(vMax, Math.sqrt(2 * 0.8 * Math.max(0, remaining - 0.2)) + 0.15);
     const aCmd = clamp(1.8 * (vTarget - this.v), -4, 1.5);
     this.accel = aCmd;
     this.v = clamp(this.v + aCmd * dt, -vMax, vMax);
     // Pure pursuit in the direction of motion: tan(delta) = 2 L y / Ld^2 holds for both directions.
-    const Ld = 3.2;
+    const Ld = 2.4;
     const target = run.poly.sampleAt(Math.min(run.poly.length, pr.s + Ld)).p;
     const rel = sub(target, this.pos);
     const ly = -rel.x * Math.sin(this.heading) + rel.y * Math.cos(this.heading);
@@ -599,6 +617,8 @@ export class Ego implements Agent {
   private looksParked(a: Agent, ctx: DriveContext): boolean {
     if (a.kind !== "vehicle") return false;
     if (a.blinker === 2 || a.vkind === "bike") return true;
+    // A vehicle that has not moved for a long time is treated as blocking, whatever the reason.
+    if (ctx.predictor.stationaryFor(a.id, ctx.t) > 30) return true;
     const f = fromAngle(a.heading);
     for (const b of ctx.agents) {
       if (b === a || b.id === this.id || b.kind !== "vehicle" || b.v > 1) continue;
@@ -621,7 +641,8 @@ export class Ego implements Agent {
     const out: { p: Vec2; r: number }[] = [];
     for (const a of agents) {
       if (a.id === this.id || a.v > 0.3 || dist(a.pos, this.pos) > 70) continue;
-      for (const c of a.kind === "ped" ? [a.pos] : footprint(a.pos, a.heading, a.length, a.width)) out.push({ p: c, r: a.kind === "ped" ? 0.4 : a.width / 2 });
+      // Inflated so that tracking error at low speed still leaves clearance.
+      for (const c of a.kind === "ped" ? [a.pos] : footprint(a.pos, a.heading, a.length, a.width)) out.push({ p: c, r: a.kind === "ped" ? 0.6 : a.width / 2 + 0.35 });
     }
     return out;
   }

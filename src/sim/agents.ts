@@ -77,8 +77,9 @@ export function scanPath(samples: PathSample[], agents: readonly Agent[], opts: 
   for (const a of agents) {
     if (a.id === self.id) continue;
     if (dist2(a.pos, first.p) > reach2) continue;
-    // Agents behind the scanning vehicle are its followers' concern; ignoring them breaks mutual waits.
-    if ((a.pos.x - first.p.x) * first.dir.x + (a.pos.y - first.p.y) * first.dir.y < -0.5) continue;
+    // Followers travelling the same way are their own concern; ignoring them breaks mutual waits at merges.
+    const behind = (a.pos.x - first.p.x) * first.dir.x + (a.pos.y - first.p.y) * first.dir.y < -0.5;
+    if (behind && a.kind === "vehicle" && Math.cos(a.heading - self.heading) > 0.5) continue;
     const isPed = a.kind === "ped";
     const probes = agentCircles(a);
     const radius = agentRadius(a) + halfW + (isPed ? opts.pedMargin : 0);

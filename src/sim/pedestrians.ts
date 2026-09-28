@@ -1,6 +1,6 @@
 import { type Agent, PED_R, agentCircles } from "./agents";
 import { Rng, type Vec2, add, dist, dist2, dot, norm, scale, sub, vec } from "./geometry";
-import type { Crossing, Lane, RoadNetwork } from "./map/network";
+import { type Crossing, type Lane, LANE_W, type RoadNetwork } from "./map/network";
 
 type PedState = "wait" | "cross" | "walk" | "done";
 
@@ -114,21 +114,23 @@ export class Pedestrians {
     return ped;
   }
 
-  /** A pedestrian stepping off the kerb mid-block across `lane` at arc length s. */
+  /** A pedestrian stepping off the kerb mid-block across the road of `lane` at arc length s. */
   spawnJaywalker(lane: Lane, s: number, fromRight: boolean): Pedestrian {
-    const seg = lane.road.seg;
-    const forward = seg.forward === lane.road;
-    const center = seg.center;
-    const cs = forward ? s + (lane.road.seg.trimA ?? 0) : center.length - s - (seg.trimB ?? 0);
-    const smp = center.sampleAt(Math.max(0, Math.min(center.length, cs)));
+    const smp = lane.poly.sampleAt(s);
     const r = { x: -smp.dir.y, y: smp.dir.x };
-    const right = add(smp.p, scale(r, seg.rightW + 1.4));
-    const left = add(smp.p, scale(r, -(seg.leftW + 1.4)));
-    // "fromRight" is relative to the lane's travel direction.
-    const laneRightIsSegRight = forward;
-    const startRight = fromRight === laneRightIsSegRight;
-    const [start, end] = startRight ? [right, left] : [left, right];
-    const ped = new Pedestrian(start, [end], "cross", this.rng.range(1.5, 1.9), null, true, true, this.rng.int(0, 4));
+    const road = lane.road;
+    const n = road.lanes.length;
+    const seg = road.seg;
+    const other = seg.forward === road ? seg.backward : seg.forward;
+    const toRightKerb = lane.k * LANE_W + LANE_W / 2 + 1.4;
+    const toLeftKerb = (n - 1 - lane.k) * LANE_W + LANE_W / 2 + (other ? other.lanes.length * LANE_W : 0) + 1.4;
+    // Steps out right beside the lane (as if from between parked cars) and crosses to the far kerb.
+    const nearRight = add(smp.p, scale(r, Math.min(toRightKerb, LANE_W / 2 + 1.6)));
+    const nearLeft = add(smp.p, scale(r, -Math.min(toLeftKerb, LANE_W / 2 + 1.6)));
+    const right = add(smp.p, scale(r, toRightKerb));
+    const left = add(smp.p, scale(r, -toLeftKerb));
+    const [start, end] = fromRight ? [nearRight, left] : [nearLeft, right];
+    const ped = new Pedestrian(start, [add(end, scale(smp.dir, this.rng.range(-1.5, 1.5)))], "cross", this.rng.range(1.5, 1.9), null, true, true, this.rng.int(0, 4));
     this.peds.push(ped);
     return ped;
   }

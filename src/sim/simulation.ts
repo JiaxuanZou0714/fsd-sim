@@ -184,7 +184,7 @@ export class Simulation {
         if (laneId < 0) continue;
         const lane = this.net.lanes[laneId];
         const ls = lane.poly.project(ref.poly.sampleAt(s).p).s;
-        if (ls > 6 && ls < lane.poly.length - 8) return { lane, s: ls };
+        if (ls > 15 && ls < lane.poly.length - 8) return { lane, s: ls };
       }
       return null;
     }

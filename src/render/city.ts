@@ -1,312 +1,301 @@
 import * as THREE from "three";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import { Rng, type Vec2, add, right, scale } from "../sim/geometry";
-import {
-  BLOCK,
-  CROSS_IN,
-  CROSS_OUT,
-  DIRS,
-  GRID,
-  LANE_W,
-  ROAD_HALF,
-  STOP_OFF,
-  type SignalColor,
-  type Turn,
-  World,
-} from "../sim/world";
+import { Polyline, type Vec2, add, lerp, polygonArea, scale } from "../sim/geometry";
+import { type DirRoad, LANE_W, type Lane, type RoadNetwork, type SignalColor } from "../sim/map/network";
 
-const MARK_Y = 0.015;
-
-interface Strip {
-  cx: number;
-  cz: number;
-  len: number;
-  width: number;
-  /** Angle of the strip's long axis around +y. */
-  rot: number;
+/** Triangle-strip ribbon along `pts`, spanning lateral offsets [left, right] (right-positive). */
+function ribbon(pts: Vec2[], left: number, right: number, y: number, out: number[]): void {
+  if (pts.length < 2) return;
+  const n = pts.length;
+  const verts: number[][] = [];
+  for (let i = 0; i < n; i++) {
+    const a = pts[Math.max(0, i - 1)];
+    const b = pts[Math.min(n - 1, i + 1)];
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    const l = Math.hypot(dx, dy) || 1;
+    dx /= l;
+    dy /= l;
+    const rx = -dy;
+    const ry = dx;
+    verts.push([pts[i].x + rx * left, pts[i].y + ry * left, pts[i].x + rx * right, pts[i].y + ry * right]);
+  }
+  for (let i = 0; i < n - 1; i++) {
+    const [lx0, ly0, rx0, ry0] = verts[i];
+    const [lx1, ly1, rx1, ry1] = verts[i + 1];
+    out.push(lx0, y, ly0, rx0, y, ry0, lx1, y, ly1, rx0, y, ry0, rx1, y, ry1, lx1, y, ly1);
+  }
 }
 
-function stripMesh(strips: Strip[], color: number): THREE.InstancedMesh {
-  const geo = new THREE.PlaneGeometry(1, 1);
-  geo.rotateX(-Math.PI / 2);
-  const mat = new THREE.MeshBasicMaterial({ color });
-  const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, strips.length));
-  const m = new THREE.Matrix4();
-  const q = new THREE.Quaternion();
-  const up = new THREE.Vector3(0, 1, 0);
-  strips.forEach((s, i) => {
-    q.setFromAxisAngle(up, s.rot);
-    m.compose(new THREE.Vector3(s.cx, MARK_Y, s.cz), q, new THREE.Vector3(s.len, 1, s.width));
-    mesh.setMatrixAt(i, m);
-  });
-  mesh.count = strips.length;
-  mesh.instanceMatrix.needsUpdate = true;
-  return mesh;
+function meshFrom(positions: number[], material: THREE.Material, receiveShadow = true): THREE.Mesh {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  g.computeVertexNormals();
+  // Ribbons are built with consistent winding; make sure normals face up.
+  const nrm = g.getAttribute("normal") as THREE.BufferAttribute;
+  for (let i = 0; i < nrm.count; i++) nrm.setXYZ(i, 0, 1, 0);
+  const m = new THREE.Mesh(g, material);
+  m.receiveShadow = receiveShadow;
+  return m;
 }
 
-/** Strip along direction d starting at p, from along-offset a to b, at lateral offset lat. */
-function along(p: Vec2, d: Vec2, a: number, b: number, lat: number, width: number): Strip {
-  const r = right(d);
-  const mid = add(add(p, scale(d, (a + b) / 2)), scale(r, lat));
-  return { cx: mid.x, cz: mid.y, len: Math.abs(b - a), width, rot: -Math.atan2(d.y, d.x) };
+function slice(poly: Polyline, s0: number, s1: number, step = 1): Vec2[] {
+  const out: Vec2[] = [];
+  for (let s = s0; s < s1; s += step) out.push(poly.sampleAt(s).p);
+  out.push(poly.sampleAt(s1).p);
+  return out;
+}
+
+/** Line halfway between two parallel lanes. */
+function between(a: Lane, b: Lane): Vec2[] {
+  const out: Vec2[] = [];
+  const n = Math.max(2, Math.ceil(a.poly.length));
+  for (let i = 0; i <= n; i++) {
+    const pa = a.poly.sampleAt((a.poly.length * i) / n).p;
+    const pb = b.poly.sampleAt((b.poly.length * i) / n).p;
+    out.push(lerp(pa, pb, 0.5));
+  }
+  return out;
 }
 
 interface LampRef {
-  node: number;
-  dirIn: number;
-  kind: "R" | "Y" | "G" | "L";
+  road: DirRoad;
+  kind: "R" | "Y" | "G";
 }
 
 export class CityView {
   readonly group = new THREE.Group();
-  private readonly lamps: THREE.InstancedMesh;
+  private lamps: THREE.InstancedMesh | null = null;
   private readonly lampRefs: LampRef[] = [];
-  private readonly colorTmp = new THREE.Color();
+  private readonly tmpColor = new THREE.Color();
 
-  constructor(private readonly world: World) {
-    const rng = new Rng(99);
+  constructor(
+    private readonly net: RoadNetwork,
+    busStops: { lane: Lane; s: number }[],
+  ) {
     this.buildGround();
+    this.buildRoads();
     this.buildMarkings();
-    this.buildBlocks(rng);
-    this.lamps = this.buildSignals();
+    this.buildBuildings();
+    this.buildSignals();
+    this.buildBusStops(busStops);
   }
 
   private buildGround(): void {
-    const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(3000, 3000),
-      new THREE.MeshStandardMaterial({ color: 0x17191d, roughness: 1 }),
-    );
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(4000, 4000), new THREE.MeshStandardMaterial({ color: 0x191b1f, roughness: 1 }));
     ground.rotation.x = -Math.PI / 2;
-    ground.position.y = -0.03;
+    ground.position.y = -0.05;
     ground.receiveShadow = true;
     ground.name = "ground";
     this.group.add(ground);
-
-    const roadMat = new THREE.MeshStandardMaterial({ color: 0x2a2d33, roughness: 0.92 });
-    const span = (GRID - 1) * BLOCK;
-    const parts: THREE.BufferGeometry[] = [];
-    for (let k = 0; k < GRID; k++) {
-      const h = new THREE.PlaneGeometry(span + ROAD_HALF * 2, ROAD_HALF * 2);
-      h.rotateX(-Math.PI / 2);
-      h.translate(span / 2, 0, k * BLOCK);
-      const v = new THREE.PlaneGeometry(ROAD_HALF * 2, span + ROAD_HALF * 2);
-      v.rotateX(-Math.PI / 2);
-      v.translate(k * BLOCK, 0.001, span / 2);
-      parts.push(h, v);
+    const parkMat = new THREE.MeshStandardMaterial({ color: 0x1f2b22, roughness: 1 });
+    for (const p of this.net.parks) {
+      const shape = new THREE.Shape(p.map((q) => new THREE.Vector2(q.x, -q.y)));
+      const g = new THREE.ShapeGeometry(shape);
+      g.rotateX(-Math.PI / 2);
+      const m = new THREE.Mesh(g, parkMat);
+      m.position.y = -0.02;
+      m.receiveShadow = true;
+      this.group.add(m);
     }
-    const merged = mergeGeometries(parts);
-    if (!merged) throw new Error("Failed to merge road geometry");
-    const roads = new THREE.Mesh(merged, roadMat);
-    roads.receiveShadow = true;
-    roads.name = "road";
-    this.group.add(roads);
+  }
+
+  private buildRoads(): void {
+    const road: number[] = [];
+    const walk: number[] = [];
+    for (const seg of this.net.segments) {
+      const c = seg.center;
+      const pts = slice(c, 0, c.length, 1.5);
+      ribbon(pts, -seg.leftW - 0.35, seg.rightW + 0.35, 0.0, road);
+      const s0 = Math.min(seg.trimA, c.length / 2);
+      const s1 = Math.max(c.length - seg.trimB, c.length / 2);
+      if (s1 - s0 > 1) {
+        const trimmed = slice(c, s0, s1, 1.5);
+        ribbon(trimmed, seg.rightW + 0.35, seg.rightW + 3.6, 0.1, walk);
+        ribbon(trimmed, -seg.leftW - 3.6, -seg.leftW - 0.35, 0.1, walk);
+      }
+    }
+    for (const j of this.net.junctions.values()) {
+      const o = j.outline;
+      if (o.length < 3) continue;
+      const ccw = polygonArea(o) > 0 ? o : [...o].reverse();
+      for (let i = 1; i < ccw.length - 1; i++) {
+        const a = ccw[0];
+        const b = ccw[i];
+        const d = ccw[i + 1];
+        road.push(a.x, 0.005, a.y, d.x, 0.005, d.y, b.x, 0.005, b.y);
+      }
+    }
+    const roadMat = new THREE.MeshStandardMaterial({ color: 0x2b2e34, roughness: 0.92, side: THREE.DoubleSide });
+    const walkMat = new THREE.MeshStandardMaterial({ color: 0x383c44, roughness: 0.95, side: THREE.DoubleSide });
+    const rm = meshFrom(road, roadMat);
+    rm.name = "road";
+    this.group.add(rm, meshFrom(walk, walkMat));
   }
 
   private buildMarkings(): void {
-    const white: Strip[] = [];
-    const yellow: Strip[] = [];
-    const w = this.world;
-    for (const n of w.nodes) {
-      // Road segments to the east and south of each node (each undirected road once).
-      for (const d of [0, 1]) {
-        if ((n.out[d] as number) < 0) continue;
-        const dv = DIRS[d] as Vec2;
-        const a = STOP_OFF;
-        const b = BLOCK - STOP_OFF;
-        yellow.push(along(n.pos, dv, a, b, 0.14, 0.12), along(n.pos, dv, a, b, -0.14, 0.12));
-        for (const side of [1, -1]) {
-          white.push(along(n.pos, dv, CROSS_OUT, BLOCK - CROSS_OUT, side * (ROAD_HALF - 0.3), 0.15));
-          for (let u = a + 1; u + 3 <= b; u += 8) white.push(along(n.pos, dv, u, u + 3, side * LANE_W, 0.13));
+    const white: number[] = [];
+    const center: number[] = [];
+    const Y = 0.03;
+    const dashed = (pts: Vec2[], width: number, dash: number, gap: number, out: number[]): void => {
+      const poly = new Polyline(pts);
+      for (let s = 1; s + dash < poly.length - 1; s += dash + gap) ribbon(slice(poly, s, s + dash, 1), -width / 2, width / 2, Y, out);
+    };
+    for (const r of this.net.roads) {
+      const lanes = r.lanes;
+      for (let k = 0; k + 1 < lanes.length; k++) dashed(between(lanes[k], lanes[k + 1]), 0.13, 3, 5, white);
+      // Right edge line.
+      const right = lanes[0];
+      if (right.poly.length > 2) ribbon(right.poly.pts, LANE_W / 2 - 0.2, LANE_W / 2 - 0.05, Y, white);
+      // Divider between directions, drawn once per two-way segment on its forward road.
+      const seg = r.seg;
+      if (seg.forward === r && seg.backward) {
+        const inner = lanes[lanes.length - 1];
+        if (inner.poly.length > 2) {
+          ribbon(inner.poly.pts, -LANE_W / 2 - 0.08, -LANE_W / 2 + 0.06, Y, center);
         }
+      } else if (seg.oneway) {
+        const left = lanes[lanes.length - 1];
+        if (left.poly.length > 2) ribbon(left.poly.pts, -LANE_W / 2 + 0.05, -LANE_W / 2 + 0.2, Y, white);
       }
-      for (let d = 0; d < 4; d++) {
-        const armOut = n.out[d] as number;
-        if (armOut < 0) continue;
-        const dv = DIRS[d] as Vec2;
-        const r = right(dv);
-        // Crosswalk stripes on this arm, parallel to the arm.
-        for (let lat = -ROAD_HALF + 0.6; lat <= ROAD_HALF - 0.5; lat += 1.1) {
-          white.push(along(n.pos, dv, CROSS_IN, CROSS_OUT, lat, 0.55));
+      // Stop line at signalised approaches.
+      if (r.signalGroup >= 0) {
+        for (const l of lanes) {
+          const end = l.poly.sampleAt(l.poly.length - 0.3);
+          const rr = { x: -end.dir.y, y: end.dir.x };
+          ribbon([add(end.p, scale(rr, -LANE_W / 2)), add(end.p, scale(rr, LANE_W / 2))], -0.25, 0.25, Y, white);
         }
-        // Stop line for traffic approaching along -dv on this arm (its right side is -r).
-        const stopC = add(add(n.pos, scale(dv, STOP_OFF + 0.25)), scale(r, -ROAD_HALF / 2));
-        white.push({ cx: stopC.x, cz: stopC.y, len: 0.45, width: ROAD_HALF - 0.4, rot: -Math.atan2(dv.y, dv.x) });
       }
     }
-    this.group.add(stripMesh(white, 0xc9ccd3), stripMesh(yellow, 0xd8ad3f));
+    for (const c of this.net.crossings) {
+      const r = { x: -c.dir.y, y: c.dir.x };
+      for (let lat = -c.seg.leftW + 0.3; lat <= c.seg.rightW - 0.3; lat += 1.0) {
+        const p = add(c.pos, scale(r, lat));
+        ribbon([add(p, scale(c.dir, -1.6)), add(p, scale(c.dir, 1.6))], -0.26, 0.26, Y + 0.002, white);
+      }
+    }
+    const wm = new THREE.MeshBasicMaterial({ color: 0xc9ccd3, side: THREE.DoubleSide });
+    const cm = new THREE.MeshBasicMaterial({ color: 0xd8ad3f, side: THREE.DoubleSide });
+    this.group.add(meshFrom(white, wm, false), meshFrom(center, cm, false));
   }
 
-  private buildBlocks(rng: Rng): void {
-    const walkMat = new THREE.MeshStandardMaterial({ color: 0x3a3e46, roughness: 0.95 });
-    const lotMat = new THREE.MeshStandardMaterial({ color: 0x202328, roughness: 1 });
-    const walkParts: THREE.BufferGeometry[] = [];
-    const lotParts: THREE.BufferGeometry[] = [];
-    const buildings: { x: number; z: number; w: number; d: number; h: number; c: number }[] = [];
-    const palette = [0x2c3140, 0x333845, 0x2a2f3a, 0x3a3f4c, 0x262a33, 0x30384a];
-    for (let bi = -1; bi < GRID; bi++) {
-      for (let bj = -1; bj < GRID; bj++) {
-        const x0 = bi * BLOCK + ROAD_HALF;
-        const x1 = (bi + 1) * BLOCK - ROAD_HALF;
-        const z0 = bj * BLOCK + ROAD_HALF;
-        const z1 = (bj + 1) * BLOCK - ROAD_HALF;
-        const slab = new THREE.BoxGeometry(x1 - x0, 0.16, z1 - z0);
-        slab.translate((x0 + x1) / 2, 0.08 - 0.02, (z0 + z1) / 2);
-        walkParts.push(slab);
-        const inset = 4.4;
-        const lot = new THREE.PlaneGeometry(x1 - x0 - inset * 2, z1 - z0 - inset * 2);
-        lot.rotateX(-Math.PI / 2);
-        lot.translate((x0 + x1) / 2, 0.145, (z0 + z1) / 2);
-        lotParts.push(lot);
-        const outer = bi < 0 || bj < 0 || bi >= GRID - 1 || bj >= GRID - 1;
-        const lx0 = x0 + inset + 1.5;
-        const lz0 = z0 + inset + 1.5;
-        const size = x1 - x0 - (inset + 1.5) * 2;
-        const cells = 2;
-        const cell = size / cells;
-        for (let a = 0; a < cells; a++) {
-          for (let b = 0; b < cells; b++) {
-            if (rng.chance(0.12)) continue;
-            const w = cell * rng.range(0.62, 0.9);
-            const d = cell * rng.range(0.62, 0.9);
-            const h = outer ? rng.range(6, 18) : rng.range(8, 34);
-            buildings.push({
-              x: lx0 + cell * (a + 0.5),
-              z: lz0 + cell * (b + 0.5),
-              w,
-              d,
-              h,
-              c: rng.pick(palette),
-            });
-          }
-        }
+  private buildBuildings(): void {
+    const parts: THREE.BufferGeometry[] = [];
+    const palette = [0x3a3d47, 0x41444f, 0x363943, 0x444855, 0x3d3a3f, 0x47464d];
+    const color = new THREE.Color();
+    for (const b of this.net.buildings) {
+      if (b.pts.length < 3) continue;
+      const shape = new THREE.Shape(b.pts.map((p) => new THREE.Vector2(p.x, -p.y)));
+      let geo: THREE.BufferGeometry;
+      try {
+        geo = new THREE.ExtrudeGeometry(shape, { depth: b.h, bevelEnabled: false, curveSegments: 1 });
+      } catch {
+        continue;
       }
+      geo.rotateX(-Math.PI / 2);
+      const n = geo.getAttribute("position").count;
+      const cols = new Float32Array(n * 3);
+      color.setHex(palette[Math.abs(Math.floor(b.pts[0].x * 7 + b.pts[0].y * 13)) % palette.length]);
+      for (let i = 0; i < n; i++) {
+        cols[i * 3] = color.r;
+        cols[i * 3 + 1] = color.g;
+        cols[i * 3 + 2] = color.b;
+      }
+      geo.setAttribute("color", new THREE.BufferAttribute(cols, 3));
+      geo.deleteAttribute("uv");
+      parts.push(geo.index ? geo.toNonIndexed() : geo);
     }
-    const walk = mergeGeometries(walkParts);
-    const lots = mergeGeometries(lotParts);
-    if (!walk || !lots) throw new Error("Failed to merge block geometry");
-    const walkMesh = new THREE.Mesh(walk, walkMat);
-    walkMesh.receiveShadow = true;
-    const lotMesh = new THREE.Mesh(lots, lotMat);
-    lotMesh.receiveShadow = true;
-    this.group.add(walkMesh, lotMesh);
-
-    const bGeo = new THREE.BoxGeometry(1, 1, 1);
-    bGeo.translate(0, 0.5, 0);
-    const bMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85, metalness: 0.05 });
-    const inst = new THREE.InstancedMesh(bGeo, bMat, buildings.length);
-    const m = new THREE.Matrix4();
-    const c = new THREE.Color();
-    buildings.forEach((b, i) => {
-      m.makeScale(b.w, b.h, b.d);
-      m.setPosition(b.x, 0.14, b.z);
-      inst.setMatrixAt(i, m);
-      inst.setColorAt(i, c.setHex(b.c));
-    });
-    inst.castShadow = true;
-    inst.receiveShadow = true;
-    this.group.add(inst);
-
-    // Faint roof outlines keep block shapes readable from the top-down camera.
-    const edges = new THREE.EdgesGeometry(bGeo);
-    const edgeParts = buildings.map((b) => {
-      const g = edges.clone();
-      g.scale(b.w, b.h, b.d);
-      g.translate(b.x, 0.14, b.z);
-      return g;
-    });
-    const mergedEdges = mergeGeometries(edgeParts);
-    if (mergedEdges) {
-      const lineMat = new THREE.LineBasicMaterial({ color: 0x4a5264, transparent: true, opacity: 0.55 });
-      this.group.add(new THREE.LineSegments(mergedEdges, lineMat));
-    }
+    const merged = mergeGeometries(parts);
+    if (!merged) return;
+    merged.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.05 });
+    const mesh = new THREE.Mesh(merged, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    this.group.add(mesh);
+    const edges = new THREE.EdgesGeometry(merged, 30);
+    this.group.add(new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x565d6e, transparent: true, opacity: 0.35 })));
   }
 
-  private buildSignals(): THREE.InstancedMesh {
+  private buildSignals(): void {
     const staticParts: THREE.BufferGeometry[] = [];
-    const lampPositions: THREE.Vector3[] = [];
-    const w = this.world;
-    for (const n of w.nodes) {
-      for (let d = 0; d < 4; d++) {
-        // Traffic approaching the node travelling along d comes from arm (d+2)%4.
-        if ((n.out[(d + 2) % 4] as number) < 0) continue;
-        const dv = DIRS[d] as Vec2;
-        const r = right(dv);
-        const polePos = add(add(n.pos, scale(dv, ROAD_HALF + 2.2)), scale(r, ROAD_HALF + 1.2));
-        const pole = new THREE.CylinderGeometry(0.12, 0.14, 6, 8);
-        pole.translate(polePos.x, 3, polePos.y);
-        staticParts.push(pole);
-        const armLen = ROAD_HALF + 1.2 - 1.4;
-        const armMid = add(polePos, scale(r, -armLen / 2));
-        const arm = new THREE.BoxGeometry(0.12, 0.12, armLen);
-        arm.rotateY(-Math.atan2(r.y, r.x) + Math.PI / 2);
-        arm.translate(armMid.x, 5.8, armMid.y);
-        staticParts.push(arm);
-        const headPos = add(polePos, scale(r, -armLen + 0.3));
-        const head = new THREE.BoxGeometry(0.4, 1.35, 0.5);
-        head.rotateY(-Math.atan2(dv.y, dv.x));
-        head.translate(headPos.x, 5.1, headPos.y);
-        staticParts.push(head);
-        const face = add(headPos, scale(dv, -0.22));
-        const kinds: ["R" | "Y" | "G" | "L", number, number][] = [
-          ["R", 5.55, 0],
-          ["Y", 5.1, 0],
-          ["G", 4.65, 0],
-          ["L", 4.65, -0.45],
-        ];
-        for (const [kind, y, lat] of kinds) {
-          const p = add(face, scale(r, lat));
-          lampPositions.push(new THREE.Vector3(p.x, y, p.y));
-          this.lampRefs.push({ node: n.id, dirIn: d, kind });
-        }
-        const leftHead = new THREE.BoxGeometry(0.36, 0.42, 0.42);
-        leftHead.rotateY(-Math.atan2(dv.y, dv.x));
-        const lh = add(headPos, scale(r, -0.45));
-        leftHead.translate(lh.x, 4.65, lh.y);
-        staticParts.push(leftHead);
+    const lampPos: THREE.Vector3[] = [];
+    for (const r of this.net.roads) {
+      if (r.signalGroup < 0) continue;
+      const right = r.lanes[0];
+      const end = right.poly.sampleAt(right.poly.length);
+      const rr = { x: -end.dir.y, y: end.dir.x };
+      const pole = add(add(end.p, scale(rr, LANE_W / 2 + 1.2)), scale(end.dir, -0.5));
+      const g = new THREE.CylinderGeometry(0.1, 0.12, 4.2, 8);
+      g.translate(pole.x, 2.1, pole.y);
+      staticParts.push(g);
+      const head = new THREE.BoxGeometry(0.34, 1.1, 0.4);
+      head.rotateY(-Math.atan2(end.dir.y, end.dir.x));
+      head.translate(pole.x, 4.6, pole.y);
+      staticParts.push(head);
+      const face = add(pole, scale(end.dir, -0.2));
+      const kinds: ["R" | "Y" | "G", number][] = [
+        ["R", 4.95],
+        ["Y", 4.6],
+        ["G", 4.25],
+      ];
+      for (const [kind, y] of kinds) {
+        lampPos.push(new THREE.Vector3(face.x, y, face.y));
+        this.lampRefs.push({ road: r, kind });
       }
     }
+    if (staticParts.length === 0) return;
     const merged = mergeGeometries(staticParts);
-    if (!merged) throw new Error("Failed to merge signal geometry");
-    const poles = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({ color: 0x23262c, roughness: 0.6, metalness: 0.4 }));
-    poles.castShadow = true;
-    this.group.add(poles);
-
-    const lampGeo = new THREE.SphereGeometry(0.15, 12, 8);
-    const lamps = new THREE.InstancedMesh(lampGeo, new THREE.MeshBasicMaterial({ color: 0xffffff }), lampPositions.length);
-    const m = new THREE.Matrix4();
-    lampPositions.forEach((p, i) => {
-      m.makeTranslation(p.x, p.y, p.z);
-      lamps.setMatrixAt(i, m);
+    if (merged) {
+      const m = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({ color: 0x24272d, roughness: 0.6, metalness: 0.4 }));
+      m.castShadow = true;
+      this.group.add(m);
+    }
+    const lamps = new THREE.InstancedMesh(new THREE.SphereGeometry(0.13, 10, 8), new THREE.MeshBasicMaterial({ color: 0xffffff }), lampPos.length);
+    const mat = new THREE.Matrix4();
+    lampPos.forEach((p, i) => {
+      mat.makeTranslation(p.x, p.y, p.z);
+      lamps.setMatrixAt(i, mat);
       lamps.setColorAt(i, new THREE.Color(0x222222));
     });
     this.group.add(lamps);
-    return lamps;
+    this.lamps = lamps;
+  }
+
+  private buildBusStops(stops: { lane: Lane; s: number }[]): void {
+    const parts: THREE.BufferGeometry[] = [];
+    for (const { lane, s } of stops) {
+      const smp = lane.poly.sampleAt(s);
+      const rr = { x: -smp.dir.y, y: smp.dir.x };
+      const p = add(smp.p, scale(rr, LANE_W / 2 + 2.0));
+      const roof = new THREE.BoxGeometry(4, 0.12, 1.4);
+      roof.rotateY(-Math.atan2(smp.dir.y, smp.dir.x));
+      roof.translate(p.x, 2.5, p.y);
+      const back = new THREE.BoxGeometry(4, 2.3, 0.08);
+      back.rotateY(-Math.atan2(smp.dir.y, smp.dir.x));
+      const bp = add(p, scale(rr, 0.65));
+      back.translate(bp.x, 1.3, bp.y);
+      parts.push(roof, back);
+    }
+    const merged = mergeGeometries(parts);
+    if (!merged) return;
+    const m = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({ color: 0x4d6a78, roughness: 0.4, metalness: 0.3, transparent: true, opacity: 0.85 }));
+    m.castShadow = true;
+    this.group.add(m);
   }
 
   updateSignals(t: number): void {
-    const off: Record<LampRef["kind"], number> = { R: 0x3a1214, Y: 0x3a2e10, G: 0x0f2f1c, L: 0x0f2f1c };
-    const on: Record<LampRef["kind"], number> = { R: 0xff3b3b, Y: 0xffc21a, G: 0x2cff7a, L: 0x2cff7a };
-    const cache = new Map<string, SignalColor>();
-    const sig = (node: number, dirIn: number, turn: Turn): SignalColor => {
-      const key = `${node}:${dirIn}:${turn}`;
-      let c = cache.get(key);
-      if (!c) {
-        c = this.world.signal(node, dirIn, turn, t);
-        cache.set(key, c);
-      }
-      return c;
-    };
+    if (!this.lamps) return;
+    const off: Record<"R" | "Y" | "G", number> = { R: 0x3a1214, Y: 0x3a2e10, G: 0x0f2f1c };
+    const on: Record<"R" | "Y" | "G", number> = { R: 0xff3b3b, Y: 0xffc21a, G: 0x2cff7a };
+    const cache = new Map<DirRoad, SignalColor | null>();
     this.lampRefs.forEach((ref, i) => {
-      let lit = false;
-      let hex = on[ref.kind];
-      if (ref.kind === "L") {
-        const c = sig(ref.node, ref.dirIn, "left");
-        lit = c !== "R";
-        hex = c === "Y" ? on.Y : on.L;
-      } else {
-        lit = sig(ref.node, ref.dirIn, "straight") === ref.kind;
+      let c = cache.get(ref.road);
+      if (c === undefined) {
+        c = this.net.laneSignal(ref.road.lanes[0], t);
+        cache.set(ref.road, c);
       }
-      this.lamps.setColorAt(i, this.colorTmp.setHex(lit ? hex : off[ref.kind]));
+      this.lamps?.setColorAt(i, this.tmpColor.setHex(c === ref.kind ? on[ref.kind] : off[ref.kind]));
     });
     if (this.lamps.instanceColor) this.lamps.instanceColor.needsUpdate = true;
   }

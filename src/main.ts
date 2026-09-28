@@ -17,11 +17,16 @@ function byId<T extends HTMLElement>(id: string): T {
   return e as T;
 }
 
+function label(id: string, text: string): void {
+  const l = byId(id).querySelector(".label");
+  if (l) l.textContent = text;
+}
+
 const canvas = byId<HTMLCanvasElement>("view");
 let sim = new Simulation(Math.floor(Math.random() * 1e9));
 const view = new View(canvas, sim);
 const hud = new Hud();
-const minimap = new Minimap(byId<HTMLCanvasElement>("minimap"), (p) => setDestinationAt(p));
+const minimap = new Minimap(byId<HTMLCanvasElement>("minimap"), sim.net, (p) => setDestinationAt(p));
 
 let paused = false;
 let speedIdx = 0;
@@ -29,15 +34,18 @@ let accumulator = 0;
 const keys = new Set<string>();
 
 function setDestinationAt(p: Vec2): void {
-  sim.setDestination(sim.destinationNear(p));
+  const d = sim.destinationNear(p);
+  if (d) sim.setDestination(d);
+  else hud.toast("附近没有可到达的车道", "info");
 }
 
 function manualInput(): ManualInput {
-  const throttle = keys.has("KeyW") || keys.has("ArrowUp") ? 1 : 0;
-  const brake = keys.has("KeyS") || keys.has("ArrowDown") || keys.has("Space") ? 1 : 0;
-  const left = keys.has("KeyA") || keys.has("ArrowLeft") ? 1 : 0;
-  const rightKey = keys.has("KeyD") || keys.has("ArrowRight") ? 1 : 0;
-  return { throttle, brake, steer: rightKey - left };
+  const has = (...k: string[]): boolean => k.some((x) => keys.has(x));
+  return {
+    throttle: has("KeyW", "ArrowUp") ? 1 : 0,
+    brake: has("KeyS", "ArrowDown", "Space") ? 1 : 0,
+    steer: (has("KeyD", "ArrowRight") ? 1 : 0) - (has("KeyA", "ArrowLeft") ? 1 : 0),
+  };
 }
 
 function toggleFsd(): void {
@@ -47,19 +55,19 @@ function toggleFsd(): void {
 
 function cycleCamera(): void {
   const i = CAMERA_MODES.indexOf(view.cameraMode);
-  view.cameraMode = CAMERA_MODES[(i + 1) % CAMERA_MODES.length] ?? "follow";
-  byId("btn-cam").querySelector(".label")!.textContent = CAMERA_LABEL[view.cameraMode] ?? "";
+  view.cameraMode = CAMERA_MODES[(i + 1) % CAMERA_MODES.length];
+  label("btn-cam", CAMERA_LABEL[view.cameraMode] ?? "");
 }
 
 function cycleSpeed(): void {
   speedIdx = (speedIdx + 1) % SPEEDS.length;
-  byId("btn-speed").querySelector(".label")!.textContent = `${SPEEDS[speedIdx]}× 速度`;
+  label("btn-speed", `${SPEEDS[speedIdx]}× 速度`);
 }
 
 function togglePause(): void {
   paused = !paused;
   byId("btn-pause").classList.toggle("on", paused);
-  byId("btn-pause").querySelector(".label")!.textContent = paused ? "继续" : "暂停";
+  label("btn-pause", paused ? "继续" : "暂停");
 }
 
 function randomDestination(): void {
@@ -68,31 +76,36 @@ function randomDestination(): void {
   else sim.setDestination(d);
 }
 
-function applySettingsFromUi(): void {
+function applySettings(): void {
   sim.settings.autoplay = byId<HTMLInputElement>("opt-autoplay").checked;
   sim.settings.randomEvents = byId<HTMLInputElement>("opt-events").checked;
   sim.settings.trafficCount = Number(byId<HTMLInputElement>("opt-traffic").value);
   sim.settings.pedCount = Number(byId<HTMLInputElement>("opt-peds").value);
+  view.showCandidates = byId<HTMLInputElement>("opt-cands").checked;
+  view.showPredictions = byId<HTMLInputElement>("opt-preds").checked;
   byId("opt-traffic-val").textContent = String(sim.settings.trafficCount);
   byId("opt-peds-val").textContent = String(sim.settings.pedCount);
 }
 
 function reset(): void {
   sim = new Simulation(Math.floor(Math.random() * 1e9));
-  applySettingsFromUi();
+  applySettings();
   sim.engageFsd();
 }
+
+const attempt = (fn: () => boolean, fail: string) => (): void => {
+  if (!fn()) hud.toast(fail, "info");
+};
 
 const actions: Record<string, () => void> = {
   KeyF: toggleFsd,
   KeyC: cycleCamera,
   KeyR: randomDestination,
-  KeyJ: () => {
-    if (!sim.spawnJaywalkerAhead()) hud.toast("前方空间不足，无法生成横穿行人", "info");
-  },
-  KeyB: () => {
-    if (!sim.spawnStalledAhead()) hud.toast("前方空间不足，无法生成故障车辆", "info");
-  },
+  KeyJ: attempt(() => sim.spawnJaywalkerAhead(), "前方空间不足，无法生成横穿行人"),
+  KeyB: attempt(() => sim.spawnStalledAhead(), "前方空间不足，无法生成违停车辆"),
+  KeyK: attempt(() => sim.spawnCyclistAhead(), "前方空间不足，无法生成自行车"),
+  KeyO: attempt(() => sim.placeOffRoad(), "未找到合适的非道路位置"),
+  KeyV: attempt(() => sim.placeWrongWay(), "未找到合适的单行道位置"),
   KeyT: cycleSpeed,
   KeyP: togglePause,
 };
@@ -118,8 +131,11 @@ const buttons: Record<string, () => void> = {
   "btn-fsd": toggleFsd,
   "btn-cam": cycleCamera,
   "btn-dest": randomDestination,
-  "btn-jay": actions.KeyJ as () => void,
-  "btn-stall": actions.KeyB as () => void,
+  "btn-jay": actions.KeyJ,
+  "btn-stall": actions.KeyB,
+  "btn-bike": actions.KeyK,
+  "btn-offroad": actions.KeyO,
+  "btn-wrongway": actions.KeyV,
   "btn-speed": cycleSpeed,
   "btn-pause": togglePause,
   "btn-reset": reset,
@@ -130,8 +146,8 @@ for (const [id, fn] of Object.entries(buttons)) {
     (ev.currentTarget as HTMLElement).blur();
   });
 }
-for (const id of ["opt-autoplay", "opt-events", "opt-traffic", "opt-peds"]) {
-  byId(id).addEventListener("input", applySettingsFromUi);
+for (const id of ["opt-autoplay", "opt-events", "opt-traffic", "opt-peds", "opt-cands", "opt-preds"]) {
+  byId(id).addEventListener("input", applySettings);
 }
 
 let downAt: { x: number; y: number } | null = null;
@@ -147,9 +163,7 @@ canvas.addEventListener("pointerup", (ev) => {
   if (p) setDestinationAt(p);
 });
 
-byId("btn-start").addEventListener("click", () => {
-  byId("intro").classList.add("hidden");
-});
+byId("btn-start").addEventListener("click", () => byId("intro").classList.add("hidden"));
 if (location.hash === "#play") byId("intro").classList.add("hidden");
 
 function resize(): void {
@@ -158,8 +172,7 @@ function resize(): void {
 }
 window.addEventListener("resize", resize);
 resize();
-
-applySettingsFromUi();
+applySettings();
 sim.engageFsd();
 
 let last = performance.now();
@@ -168,7 +181,7 @@ function frame(now: number): void {
   last = now;
   const wall = now / 1000;
   if (!paused) {
-    accumulator += dt * (SPEEDS[speedIdx] ?? 1);
+    accumulator += dt * SPEEDS[speedIdx];
     let steps = 0;
     const input = manualInput();
     while (accumulator >= STEP && steps < 16) {

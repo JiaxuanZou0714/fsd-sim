@@ -371,7 +371,7 @@ export class Traffic {
   private tryLaneChange(car: NpcVehicle, prefer: "left" | "right" | "any"): boolean {
     const seg = car.seg;
     const lane = seg.lane;
-    if (!lane || seg.lcLen > 0 || car.vkind === "bus" || car.vkind === "truck") return false;
+    if (!lane || seg.lcLen > 0) return false;
     const u = seg.u0 + car.s;
     const L = clamp(car.v * 2.4, 8, 26);
     if (lane.poly.length - u < L + 10) return false;
@@ -420,14 +420,14 @@ export class Traffic {
     const p: IdmParams = { aMax: spec.aMax, bComf: spec.bComf, T: spec.headway * car.profile.headwayMul, s0: spec.s0 };
     const lookahead = Math.min(80, Math.max(30, car.v * 3.8 + 18));
     let samples = this.sampleAhead(car, lookahead);
-    const scanOpts = { self: car, margin: 0.25, pedMargin: 0.6, horizon: 2.5 };
+    const scanOpts = { self: car, margin: 0.45, pedMargin: 0.6, horizon: 2.5 };
     let obs: Obstacle | null = scanPath(samples, agents, scanOpts);
 
     // Lane changes: around obstructions, or to overtake when the driver is inclined to.
     if (obs && obs.agent.kind === "vehicle" && obs.gap < 30 && car.seg.lane) {
       const lead = this.byId.get(obs.agent.id);
       const obstructed = lead ? this.isObstruction(lead) : false;
-      const slow = car.profile.overtakes && obs.agent.v < car.v0 - 4 && obs.gap < 22;
+      const slow = car.profile.overtakes && car.vkind !== "bus" && car.vkind !== "truck" && obs.agent.v < car.v0 - 4 && obs.gap < 22;
       if ((obstructed || slow) && this.tryLaneChange(car, "left")) {
         samples = this.sampleAhead(car, lookahead);
         obs = scanPath(samples, agents, scanOpts);

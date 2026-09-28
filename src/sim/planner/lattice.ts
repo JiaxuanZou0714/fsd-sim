@@ -344,7 +344,9 @@ export class LatticePlanner {
                 if (c < clear) clear = c;
               }
             }
-            const margin = (a.kind === "ped" ? 0.55 : 0.2) + 0.05 * t;
+            // Crossing and oncoming traffic gets more room than traffic moving the same way.
+            const aligned = Math.cos(pr.headings[k] - h) > 0.85;
+            const margin = a.kind === "ped" ? 1.0 + 0.15 * t : (aligned ? 0.25 : 0.9) + (aligned ? 0.05 : 0.1) * t;
             const cls: Limit = a.kind === "ped" ? "ped" : a.vkind === "bike" ? "bike" : pr.still ? "static" : "vehicle";
             if (clear < margin) {
               hitT = Math.min(hitT, t);

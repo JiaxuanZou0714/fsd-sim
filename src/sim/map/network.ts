@@ -803,7 +803,8 @@ export class RoadNetwork {
       if (dAng > maxAngle) continue;
       if (pr.s <= 0.01 && dot(sub(p, l.poly.pts[0]), dir) < -2) continue;
       if (pr.s >= l.poly.length - 0.01 && dot(sub(p, l.poly.pts[l.poly.pts.length - 1]), dir) > 2) continue;
-      const score = pr.dist + dAng * 3;
+      // Lanes that cannot reach the rest of the network are only chosen when clearly closer.
+      const score = pr.dist + dAng * 3 + (this.core && !this.core.has(l) ? 2.5 : 0);
       if (score < bestScore) {
         bestScore = score;
         best = { lane: l, s: pr.s, lateral: pr.lateral };

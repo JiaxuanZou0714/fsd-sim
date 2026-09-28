@@ -1,7 +1,8 @@
 import { it } from "vitest";
 import { Simulation } from "../src/sim/simulation";
 declare const process: { env: Record<string, string | undefined> };
-it("sweep", () => {
+// Stress sweep; runs only when SEEDS is set, e.g. SEEDS=1,2,3 DUR=300 npx vitest run tests/sweep.test.ts
+it.runIf(!!process.env.SEEDS)("sweep", () => {
   const seeds = (process.env.SEEDS ?? "1,2,3,4,5,6").split(",").map(Number);
   const dur = Number(process.env.DUR ?? 300);
   for (const seed of seeds) {
