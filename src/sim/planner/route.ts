@@ -131,9 +131,8 @@ export function planRoute(start: Lane, s0: number, goal: RouteGoal): RouteStep[]
       if (!nb) continue;
       // Map data splits roads into short pieces; a lane change may start on one and finish on the
       // next, so short lanes allow a compressed lane change at a higher price.
-      const lcLen = Math.min(LC_DIST, remaining - 1);
-      if (lcLen < 3) continue;
-      const sIn = Math.min(lab.sIn + lcLen / 2, nb.poly.length - 0.5);
+      const lcLen = Math.max(0, Math.min(LC_DIST, remaining - 1));
+      const sIn = Math.max(0, Math.min(lab.sIn + lcLen / 2, nb.poly.length - 0.5));
       relax(nb, lab.cost + lcLen + LC_COST + (LC_DIST - lcLen) * 3, sIn, "lc", null);
     }
   }

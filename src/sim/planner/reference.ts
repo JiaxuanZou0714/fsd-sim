@@ -163,5 +163,29 @@ export function buildReference(net: RoadNetwork, route: RouteStep[], startS: num
     s = 0.5;
   }
   const destPoint = dest.lane.poly.sampleAt(dest.s).p;
-  return new Reference(pts, meta, gates, spans, destPoint, used);
+  return new Reference(smoothGuide(pts), meta, gates, spans, destPoint, used);
+}
+
+/**
+ * Map data splits roads at every node, so a single turn can span several short lanes and
+ * connectors with a curvature spike at each joint. A moving average of about 3 m removes the
+ * spikes while keeping vertex indices (and therefore the metadata) aligned.
+ */
+function smoothGuide(pts: Vec2[]): Vec2[] {
+  let cur = pts;
+  for (let pass = 0; pass < 3; pass++) {
+    const next: Vec2[] = new Array(cur.length);
+    for (let i = 0; i < cur.length; i++) {
+      const r = Math.min(3, i, cur.length - 1 - i);
+      let x = 0;
+      let y = 0;
+      for (let k = -r; k <= r; k++) {
+        x += cur[i + k].x;
+        y += cur[i + k].y;
+      }
+      next[i] = { x: x / (2 * r + 1), y: y / (2 * r + 1) };
+    }
+    cur = next;
+  }
+  return cur;
 }

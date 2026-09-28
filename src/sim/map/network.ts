@@ -3,7 +3,6 @@ import {
   type Vec2,
   add,
   angleOf,
-  convexHull,
   cross,
   cubicBezier,
   dist,
@@ -22,6 +21,38 @@ import {
 import type { MapData } from "./mapData";
 
 export const LANE_W = 3.3;
+/** Smallest turn radius the junction geometry is built for (the ego's minimum is about 4.2 m). */
+export const MIN_TURN_RADIUS = 5.5;
+const ROAD_RES = 0.5;
+
+/** Rounded kerb from point a (travelling along da) to point b (leaving along db). */
+function kerbCorner(a: Vec2, da: Vec2, b: Vec2, db: Vec2): Vec2[] {
+  const denom = cross(da, db);
+  let h0 = dist(a, b) / 3;
+  let h1 = h0;
+  if (Math.abs(denom) > 0.15) {
+    const w = sub(b, a);
+    const ta = cross(w, db) / denom;
+    const tb = cross(w, da) / denom;
+    if (ta > 0.2 && tb < -0.2) {
+      h0 = ta * 0.5523;
+      h1 = -tb * 0.5523;
+    }
+  }
+  const p1 = add(a, scale(da, h0));
+  const p2 = sub(b, scale(db, h1));
+  const n = Math.max(4, Math.ceil(dist(a, b) / 0.8));
+  const out: Vec2[] = [];
+  for (let i = 0; i <= n; i++) out.push(cubicBezier(a, p1, p2, b, i / n));
+  return out;
+}
+
+function minRadius(poly: Polyline): number {
+  let maxK = 0;
+  // Ignore the first and last vertices, where finite differences are unreliable.
+  for (let i = 2; i < poly.kappa.length - 2; i++) maxK = Math.max(maxK, poly.kappa[i]);
+  return maxK > 1e-6 ? 1 / maxK : Infinity;
+}
 
 export type Turn = "straight" | "left" | "right" | "uturn";
 
@@ -47,6 +78,8 @@ export interface Junction {
   boundary: boolean;
   /** Outline used for rendering and the drivable-area raster. */
   outline: Vec2[];
+  /** Kerb curves between neighbouring arms. */
+  corners: Vec2[][];
 }
 
 export interface Segment {
@@ -206,9 +239,15 @@ export class RoadNetwork {
     this.bounds = data.bounds;
     const raw = this.splitSegments(data);
     this.buildSegments(raw);
-    this.computeTrims();
-    this.buildLanes();
-    this.buildConnectors();
+    // Junction size is increased where needed so that every turn has room for a drivable radius.
+    const extra = new Map<string, number>();
+    for (let iter = 0; iter < 5; iter++) {
+      this.computeTrims(extra);
+      this.resetLanes();
+      this.buildLanes();
+      this.buildConnectors();
+      if (!this.growTightJunctions(extra)) break;
+    }
     this.buildConflicts();
     this.buildSignals(data.signals);
     this.buildCrossings(data.crossings);
@@ -284,7 +323,7 @@ export class RoadNetwork {
   private junctionAt(id: number, pos: Vec2): Junction {
     let j = this.junctions.get(id);
     if (!j) {
-      j = { id, pos, incoming: [], outgoing: [], connectors: [], controller: null, circular: false, boundary: id < 0, outline: [] };
+      j = { id, pos, incoming: [], outgoing: [], connectors: [], controller: null, circular: false, boundary: id < 0, outline: [], corners: [] };
       this.junctions.set(id, j);
     }
     return j;
@@ -357,7 +396,47 @@ export class RoadNetwork {
     return norm(sub(c.sampleAt(Math.max(0, c.length - 4)).p, c.pts[c.pts.length - 1]));
   }
 
-  private computeTrims(): void {
+  private resetLanes(): void {
+    this.lanes.length = 0;
+    this.connectors.length = 0;
+    for (const r of this.roads) r.lanes = [];
+    for (const j of this.junctions.values()) j.connectors = [];
+  }
+
+  /**
+   * Increases the trim of both arms of every turn whose connector is tighter than MIN_TURN_RADIUS.
+   * Returns true when anything changed.
+   */
+  private growTightJunctions(extra: Map<string, number>): boolean {
+    let changed = false;
+    for (const c of this.connectors) {
+      if (c.turn === "uturn" || c.poly.length < 0.5) continue;
+      const theta = Math.abs(Math.atan2(cross(c.from.poly.sampleAt(c.from.poly.length).dir, c.to.poly.sampleAt(0).dir), dot(c.from.poly.sampleAt(c.from.poly.length).dir, c.to.poly.sampleAt(0).dir)));
+      if (theta < 0.2) continue;
+      const r = minRadius(c.poly);
+      if (r >= MIN_TURN_RADIUS) continue;
+      const grow = Math.min(12, (MIN_TURN_RADIUS - r) * Math.tan(Math.min(theta, 2.4) / 2) + 0.6);
+      // The incoming road ends at the junction and the outgoing road starts there; map each to
+      // the end of its segment ("a" is the segment start, "b" its end).
+      const ends: [Segment, "a" | "b"][] = [
+        [c.from.road.seg, c.from.road === c.from.road.seg.forward ? "b" : "a"],
+        [c.to.road.seg, c.to.road === c.to.road.seg.forward ? "a" : "b"],
+      ];
+      for (const [seg, end] of ends) {
+        const key = `${seg.id}:${end}`;
+        const cur = extra.get(key) ?? 0;
+        const cap = seg.center.length * 0.45;
+        const next = Math.min(cap, cur + grow);
+        if (next > cur + 0.05) {
+          extra.set(key, next);
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  private computeTrims(extra: Map<string, number> = new Map()): void {
     for (const j of this.junctions.values()) {
       const segs = this.segments.filter((s) => s.a === j.id || s.b === j.id);
       const degree = segs.length;
@@ -384,8 +463,9 @@ export class RoadNetwork {
           trim = Math.min(need, len * 0.42);
           if (degree === 2 && trim < 0.8) trim = Math.min(0.8, len * 0.3);
         }
-        if (s.a === j.id) s.trimA = trim;
-        if (s.b === j.id) s.trimB = trim;
+        const cap = len * 0.45;
+        if (s.a === j.id) s.trimA = Math.min(cap, Math.max(trim, trim + (extra.get(`${s.id}:a`) ?? 0)));
+        if (s.b === j.id) s.trimB = Math.min(cap, Math.max(trim, trim + (extra.get(`${s.id}:b`) ?? 0)));
       }
     }
   }
@@ -443,10 +523,23 @@ export class RoadNetwork {
     let pts: Vec2[];
     if (d < 0.2) pts = [p0, add(p0, scale(dIn, 0.2))];
     else {
-      const h = Math.max(0.3, d / (turn === "uturn" ? 1.4 : 2.6));
-      const p1 = add(p0, scale(dIn, h));
-      const p2 = sub(p3, scale(dOut, h));
-      const n = Math.max(3, Math.ceil((d * 1.3) / 0.5));
+      let h0 = Math.max(0.3, d / (turn === "uturn" ? 1.4 : 3));
+      let h1 = h0;
+      // For turns, tangents meet where the two lane lines cross; handles of 0.55 x the tangent
+      // lengths give a near-circular arc with the largest radius the junction allows.
+      const denom = cross(dIn, dOut);
+      if (turn !== "uturn" && Math.abs(denom) > 0.2) {
+        const w = sub(p3, p0);
+        const ta = cross(w, dOut) / denom;
+        const tb = cross(w, dIn) / denom;
+        if (ta > 0.3 && tb < -0.3) {
+          h0 = ta * 0.5523;
+          h1 = -tb * 0.5523;
+        }
+      }
+      const p1 = add(p0, scale(dIn, h0));
+      const p2 = sub(p3, scale(dOut, h1));
+      const n = Math.max(3, Math.ceil((d * 1.4) / 0.5));
       pts = [];
       for (let i = 0; i <= n; i++) pts.push(cubicBezier(p0, p1, p2, p3, i / n));
     }
@@ -700,16 +793,45 @@ export class RoadNetwork {
   private buildJunctionOutlines(): void {
     for (const j of this.junctions.values()) {
       if (j.boundary) continue;
-      const pts: Vec2[] = [];
-      const segs = this.segments.filter((s) => s.a === j.id || s.b === j.id);
-      for (const s of segs) {
-        const atA = s.a === j.id;
-        const sArc = atA ? s.trimA : s.center.length - s.trimB;
-        const smp = s.center.sampleAt(sArc);
-        const r = { x: -smp.dir.y, y: smp.dir.x };
-        pts.push(add(smp.p, scale(r, s.rightW + 0.3)), add(smp.p, scale(r, -(s.leftW + 0.3))));
+      const arms = this.segments
+        .flatMap((sg) => {
+          const out: { seg: Segment; atA: boolean }[] = [];
+          if (sg.a === j.id) out.push({ seg: sg, atA: true });
+          if (sg.b === j.id) out.push({ seg: sg, atA: false });
+          return out;
+        })
+        .map(({ seg, atA }) => {
+          const sArc = atA ? seg.trimA : seg.center.length - seg.trimB;
+          const smp = seg.center.sampleAt(sArc);
+          const d = atA ? smp.dir : scale(smp.dir, -1);
+          const r = { x: -d.y, y: d.x };
+          // Extra width at the mouth leaves room for the rear wheels tracking inside the front in turns.
+          const wR = (atA ? seg.rightW : seg.leftW) + 0.6;
+          const wL = (atA ? seg.leftW : seg.rightW) + 0.6;
+          return { d, ang: angleOf(d), R: add(smp.p, scale(r, wR)), L: add(smp.p, scale(r, -wL)), p: smp.p };
+        })
+        .sort((a, b) => a.ang - b.ang);
+      if (arms.length === 0) continue;
+      const outline: Vec2[] = [];
+      const corners: Vec2[][] = [];
+      if (arms.length === 1) {
+        const a = arms[0];
+        const back = scale(a.d, -Math.max(2, dist(a.L, a.R) / 2));
+        outline.push(a.L, a.R, add(a.R, back), add(a.L, back));
+      } else {
+        for (let i = 0; i < arms.length; i++) {
+          const a = arms[i];
+          const b = arms[(i + 1) % arms.length];
+          outline.push(a.L, a.R);
+          let gap = b.ang - a.ang;
+          if (gap <= 0) gap += Math.PI * 2;
+          const curve = gap < 2.95 ? kerbCorner(a.R, scale(a.d, -1), b.L, b.d) : [a.R, b.L];
+          corners.push(curve);
+          for (let k = 1; k < curve.length - 1; k++) outline.push(curve[k]);
+        }
       }
-      if (pts.length >= 3) j.outline = convexHull(pts);
+      j.outline = outline;
+      j.corners = corners;
     }
   }
 
@@ -888,7 +1010,7 @@ export class MapGrid {
   readonly y0: number;
   /** 1 where a building occupies the cell. */
   readonly building: Uint8Array;
-  /** 1 on the carriageway (lanes, connectors, junction areas). */
+  /** 1 on the carriageway (lanes, connectors, junction areas), at ROAD_RES resolution. */
   readonly road: Uint8Array;
   /** Distance in metres to the nearest building cell (capped). */
   readonly clearance: Float32Array;
@@ -900,43 +1022,56 @@ export class MapGrid {
     this.w = Math.ceil(b.maxX - b.minX + 40);
     this.h = Math.ceil(b.maxY - b.minY + 40);
     this.building = new Uint8Array(this.w * this.h);
-    this.road = new Uint8Array(this.w * this.h);
-    for (const bd of net.buildings) this.fillPolygon(bd.pts, this.building);
-    for (const j of net.junctions.values()) if (j.outline.length >= 3) this.fillPolygon(j.outline, this.road);
+    this.rw = this.w * 2;
+    this.rh = this.h * 2;
+    this.road = new Uint8Array(this.rw * this.rh);
+    for (const bd of net.buildings) this.fillPolygon(bd.pts, this.building, this.res, this.w, this.h);
+    for (const j of net.junctions.values()) if (j.outline.length >= 3) this.fillPolygon(j.outline, this.road, ROAD_RES, this.rw, this.rh);
     const stamp = (poly: Polyline, r: number): void => {
-      for (let s = 0; s <= poly.length; s += 0.5) {
+      const rc = Math.ceil(r / ROAD_RES) + 1;
+      for (let s = 0; s <= poly.length; s += 0.4) {
         const p = poly.sampleAt(s).p;
-        const ci = Math.floor((p.x - this.x0) / this.res);
-        const cj = Math.floor((p.y - this.y0) / this.res);
-        const rr = Math.ceil(r);
-        for (let dj = -rr; dj <= rr; dj++) {
-          for (let di = -rr; di <= rr; di++) {
-            if (di * di + dj * dj > r * r) continue;
+        const ci = Math.floor((p.x - this.x0) / ROAD_RES);
+        const cj = Math.floor((p.y - this.y0) / ROAD_RES);
+        for (let dj = -rc; dj <= rc; dj++) {
+          for (let di = -rc; di <= rc; di++) {
             const i = ci + di;
             const jj = cj + dj;
-            if (i >= 0 && jj >= 0 && i < this.w && jj < this.h) this.road[jj * this.w + i] = 1;
+            if (i < 0 || jj < 0 || i >= this.rw || jj >= this.rh) continue;
+            const cx = this.x0 + (i + 0.5) * ROAD_RES;
+            const cy = this.y0 + (jj + 0.5) * ROAD_RES;
+            if ((cx - p.x) ** 2 + (cy - p.y) ** 2 <= r * r) this.road[jj * this.rw + i] = 1;
           }
         }
       }
     };
-    for (const l of net.lanes) stamp(l.poly, LANE_W / 2 + 0.2);
+    for (const l of net.lanes) stamp(l.poly, LANE_W / 2 + 0.15);
     for (const c of net.connectors) stamp(c.poly, LANE_W / 2);
     // Roads take precedence over building footprints that overlap them in the data.
-    for (let i = 0; i < this.building.length; i++) if (this.road[i]) this.building[i] = 0;
+    for (let j = 0; j < this.h; j++) {
+      for (let i = 0; i < this.w; i++) {
+        const k = j * this.w + i;
+        if (this.building[k] && this.road[j * 2 * this.rw + i * 2]) this.building[k] = 0;
+      }
+    }
     this.clearance = this.distanceTransform();
   }
 
-  private fillPolygon(pts: Vec2[], target: Uint8Array): void {
+  /** Road raster size (ROAD_RES cells). */
+  readonly rw: number;
+  readonly rh: number;
+
+  private fillPolygon(pts: Vec2[], target: Uint8Array, res: number, w: number, h: number): void {
     let minY = Infinity;
     let maxY = -Infinity;
     for (const p of pts) {
       minY = Math.min(minY, p.y);
       maxY = Math.max(maxY, p.y);
     }
-    const j0 = Math.max(0, Math.floor((minY - this.y0) / this.res));
-    const j1 = Math.min(this.h - 1, Math.ceil((maxY - this.y0) / this.res));
+    const j0 = Math.max(0, Math.floor((minY - this.y0) / res));
+    const j1 = Math.min(h - 1, Math.ceil((maxY - this.y0) / res));
     for (let j = j0; j <= j1; j++) {
-      const y = this.y0 + (j + 0.5) * this.res;
+      const y = this.y0 + (j + 0.5) * res;
       const xs: number[] = [];
       for (let a = 0, bI = pts.length - 1; a < pts.length; bI = a++) {
         const p = pts[a];
@@ -945,9 +1080,9 @@ export class MapGrid {
       }
       xs.sort((u, v) => u - v);
       for (let k = 0; k + 1 < xs.length; k += 2) {
-        const i0 = Math.max(0, Math.ceil((xs[k] - this.x0) / this.res - 0.5));
-        const i1 = Math.min(this.w - 1, Math.floor((xs[k + 1] - this.x0) / this.res - 0.5));
-        for (let i = i0; i <= i1; i++) target[j * this.w + i] = 1;
+        const i0 = Math.max(0, Math.ceil((xs[k] - this.x0) / res - 0.5));
+        const i1 = Math.min(w - 1, Math.floor((xs[k + 1] - this.x0) / res - 0.5));
+        for (let i = i0; i <= i1; i++) target[j * w + i] = 1;
       }
     }
   }
@@ -1003,8 +1138,10 @@ export class MapGrid {
   }
 
   onRoad(p: Vec2): boolean {
-    const k = this.idx(p);
-    return k >= 0 && this.road[k] === 1;
+    const i = Math.floor((p.x - this.x0) / ROAD_RES);
+    const j = Math.floor((p.y - this.y0) / ROAD_RES);
+    if (i < 0 || j < 0 || i >= this.rw || j >= this.rh) return false;
+    return this.road[j * this.rw + i] === 1;
   }
 
   inside(p: Vec2, margin = 0): boolean {

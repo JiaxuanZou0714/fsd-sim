@@ -484,6 +484,10 @@ export class Ego implements Agent {
         maxExpansions: radius < 50 ? 25000 : 45000,
       });
       if (res) {
+        // Continue along the goal lane for a few metres so the vehicle ends up aligned with it.
+        const g = res.goal;
+        const tail = res.path[res.path.length - 1];
+        if (tail.dir > 0) for (let k = 1; k <= 5; k++) res.path.push({ x: g.x + Math.cos(g.h) * k, y: g.y + Math.sin(g.h) * k, h: g.h, dir: 1 });
         const runs = splitByDirection(res.path).map((r) => ({ poly: new Polyline(r.map((p) => ({ x: p.x, y: p.y }))), dir: r[0].dir }));
         const goal = goals.find((g) => g.x === res.goal.x && g.y === res.goal.y) ?? null;
         this.free = { path: res.path, runs, run: 0, goalLane: goal?.lane ?? null };
@@ -534,10 +538,13 @@ export class Ego implements Agent {
     if (remaining < 0.5 && Math.abs(this.v) < 0.25) {
       m.run++;
       if (m.run >= m.runs.length) {
-        this.fsd = "lane";
-        this.free = null;
-        this.routeTimer = 0;
-        this.planTimer = 0;
+        // Hand over only once a lane matches; otherwise search again from here.
+        if (this.localize(net)) {
+          this.fsd = "lane";
+          this.free = null;
+          this.routeTimer = 0;
+          this.planTimer = 0;
+        } else this.searchFree(net, this.staticObstacles(ctx.agents));
       }
       this.v = 0;
       return;

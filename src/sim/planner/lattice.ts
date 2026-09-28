@@ -498,6 +498,20 @@ export class LatticePlanner {
         if (d > rightLimit) cost += (junction ? 22 : 150) * (d - rightLimit) * w;
         if (sigma < 30) cost += 0.9 * d * d * w * 0.1;
         if (blockedAt === Infinity && net.grid.clearanceAt({ x: x[i], y: y[i] }) < hw + 0.15) blockedAt = sigma;
+        // Body corners over the kerb: the footprint, not just the centre line, must stay on the road.
+        if (sigma < 40) {
+          const ch = Math.cos(h[i]);
+          const sh = Math.sin(h[i]);
+          const fx = (ego.length / 2) * ch;
+          const fy = (ego.length / 2) * sh;
+          const lx = -sh * hw;
+          const ly = ch * hw;
+          let offCorners = 0;
+          for (const [a, b] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+            if (!net.grid.onRoad({ x: x[i] + fx * a + lx * b, y: y[i] + fy * a + ly * b })) offCorners++;
+          }
+          cost += 30 * offCorners * w;
+        }
       }
     }
     for (let i = 1; i < n - 1; i++) {
