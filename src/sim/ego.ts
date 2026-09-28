@@ -248,7 +248,9 @@ export class Ego implements Agent {
       const b = this.route[i + 1] as Edge;
       const turn = turnOf(a.dir, b.dir) as Turn;
       stopIdx.push({ idx: pts.length - 1, node: a.to, dirIn: a.dir, turn, ri: i });
-      const nextLane = turn === "left" ? 1 : turn === "right" ? 0 : lane;
+      // Turns keep their lane: left from the inner lane, right from the outer lane, and a
+      // turn forced from the other lane stays parallel instead of merging.
+      const nextLane = lane;
       const conn = world.connector(a, lane, b, nextLane);
       for (const p of conn.pts) push(p, i, nextLane, PATH_KIND_CONN);
       lane = nextLane;
@@ -457,7 +459,8 @@ export class Ego implements Agent {
     this.v = Math.max(0, this.v + this.accel * dt);
     if (this.v < 0.05 && this.accel < 0) this.v = 0;
 
-    if (Math.abs(destGap) < 2.5 && this.v < 0.3) {
+    const blockedNearDest = obs !== null && obs.gap + CAR_HALF_LEN < destGap && destGap < 10;
+    if ((Math.abs(destGap) < 2.5 || blockedNearDest) && this.v < 0.3) {
       this.arrived = true;
       intent = "arrived";
     }

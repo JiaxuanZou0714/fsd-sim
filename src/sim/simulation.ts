@@ -69,7 +69,7 @@ export class Simulation {
     this.peds = new Pedestrians(this.world, this.rng);
 
     const startEdge = this.world.edge(this.world.node(2 * 5 + 1).out[0] as number);
-    const startPos = this.world.lanePoint(startEdge, laneOffset(0), 8);
+    const startPos = this.world.lanePoint(startEdge, laneOffset(0), 18);
     this.ego = new Ego(startPos, angleOfDir(startEdge.dir));
 
     for (let i = 0; i < this.settings.trafficCount; i++) this.traffic.spawnRandom([startPos], 25);
@@ -180,19 +180,19 @@ export class Simulation {
   spawnStalledAhead(): boolean {
     const anchor = this.egoAnchor();
     if (!anchor) return false;
+    const lane = anchor.lane;
     let edge = anchor.edge;
-    let lane = anchor.lane;
     let u = anchor.u + Math.max(40, this.ego.v * 4);
     if (u > edge.length - 10) {
       if (!anchor.next) return false;
-      const turn = turnOf(edge.dir, anchor.next.dir);
-      lane = turn === "left" ? 1 : turn === "right" ? 0 : lane;
       edge = anchor.next;
       u = 26;
     }
     const p = this.world.lanePoint(edge, laneOffset(lane), u);
     if (this.traffic.cars.some((c) => dist(c.pos, p) < 9)) return false;
     if (this.traffic.cars.some((c) => c.stalled && c.seg.edge.id === edge.id)) return false;
+    const dest = this.ego.dest;
+    if (dest && dest.edge.id === edge.id && Math.abs(dest.u - u) < 20) return false;
     this.traffic.spawnOnEdge(edge, lane, u, true);
     this.emit("前方车辆故障停驶", "warn");
     return true;
@@ -201,12 +201,12 @@ export class Simulation {
   step(dt: number, manual: ManualInput = NO_INPUT): void {
     this.t += dt;
     const agents = this.agents;
-    const anchor = this.egoAnchor();
-    const egoOcc: Occupant[] = anchor
-      ? [{ id: this.ego.id, edgeId: anchor.edge.id, lane: anchor.lane, u: anchor.u, v: this.ego.v, obstruction: false }]
+    const loc = this.ego.localize(this.world);
+    const egoOcc: Occupant[] = loc
+      ? [{ id: this.ego.id, edgeId: loc.edge.id, lane: loc.lane, u: loc.u, v: this.ego.v, obstruction: false }]
       : [];
     this.traffic.update(dt, this.t, agents, this.ego.pos, this.settings.trafficCount, egoOcc);
-    this.peds.update(dt, this.t, this.settings.pedCount);
+    this.peds.update(dt, this.t, this.settings.pedCount, [this.ego, ...this.traffic.cars]);
 
     const before = this.ego.pos;
     const wasFsd = this.ego.mode === "fsd";

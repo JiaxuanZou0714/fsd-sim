@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FSD 城市自动驾驶模拟器</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='10' fill='%232f7bff'/></svg>" />
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+
+    <div class="hud">
+      <section class="panel drive">
+        <div class="speed-row">
+          <span id="blink-l" class="blinker">
+            <svg viewBox="0 0 24 24"><path d="M10 5l-7 7 7 7v-4h11V9H10z" /></svg>
+          </span>
+          <div class="speed-box">
+            <div id="speed" class="speed">0</div>
+            <div class="unit">km/h</div>
+          </div>
+          <span id="blink-r" class="blinker">
+            <svg viewBox="0 0 24 24"><path d="M14 5l7 7-7 7v-4H3V9h11z" /></svg>
+          </span>
+        </div>
+        <div class="drive-meta">
+          <div id="gear" class="gear"><span>P</span><span>R</span><span>N</span><span>D</span></div>
+          <div class="limit-sign" title="限速"><span id="limit">50</span></div>
+        </div>
+        <div id="fsd-pill" class="fsd-pill">
+          <svg viewBox="0 0 24 24" class="wheel">
+            <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2" />
+            <circle cx="12" cy="12" r="2.2" fill="currentColor" />
+            <path d="M3.5 10.5h6.3M14.2 10.5h6.3M12 14.2V21" stroke="currentColor" stroke-width="2" fill="none" />
+          </svg>
+          <span id="fsd-label">FSD 未启用</span>
+        </div>
+        <div id="intent" class="intent" data-tone="muted">
+          <span class="dot"></span><span id="intent-text">手动驾驶</span>
+        </div>
+      </section>
+
+      <section id="nav" class="panel nav hidden">
+        <div id="nav-icon" class="nav-icon"></div>
+        <div class="nav-body">
+          <div class="nav-main"><span id="nav-dist">0 米</span><span id="nav-text" class="nav-text"></span></div>
+          <div id="nav-remain" class="nav-remain"></div>
+        </div>
+      </section>
+
+      <div id="toasts" class="toasts"></div>
+
+      <section class="panel map">
+        <div class="panel-title">导航地图 <span>点击地图或路面设置目的地</span></div>
+        <canvas id="minimap"></canvas>
+      </section>
+
+      <section class="panel stats">
+        <div class="panel-title">行驶统计</div>
+        <div class="stat-grid">
+          <div><b id="stat-fsd">0.00</b><span>FSD 里程 (km)</span></div>
+          <div><b id="stat-manual">0.00</b><span>手动里程 (km)</span></div>
+          <div><b id="stat-arrivals">0</b><span>到达次数</span></div>
+          <div><b id="stat-interventions">0</b><span>接管次数</span></div>
+          <div><b id="stat-emergency">0</b><span>紧急制动</span></div>
+          <div><b id="stat-collisions">0</b><span>碰撞次数</span></div>
+        </div>
+        <div class="sim-time">模拟时间 <span id="stat-time">0:00</span></div>
+      </section>
+
+      <section class="panel settings">
+        <div class="panel-title">场景设置</div>
+        <label class="switch"><input id="opt-autoplay" type="checkbox" checked /><span></span>到达后自动前往新目的地</label>
+        <label class="switch"><input id="opt-events" type="checkbox" checked /><span></span>随机突发事件</label>
+        <label class="range">车辆数量 <b id="opt-traffic-val">34</b><input id="opt-traffic" type="range" min="0" max="70" value="34" /></label>
+        <label class="range">行人数量 <b id="opt-peds-val">40</b><input id="opt-peds" type="range" min="0" max="120" value="40" /></label>
+      </section>
+
+      <nav class="dock">
+        <button id="btn-fsd" class="primary"><span class="label">启用 FSD</span><kbd>F</kbd></button>
+        <button id="btn-dest"><span class="label">随机目的地</span><kbd>R</kbd></button>
+        <button id="btn-jay"><span class="label">行人横穿</span><kbd>J</kbd></button>
+        <button id="btn-stall"><span class="label">故障车辆</span><kbd>B</kbd></button>
+        <button id="btn-cam"><span class="label">跟随视角</span><kbd>C</kbd></button>
+        <button id="btn-speed"><span class="label">1× 速度</span><kbd>T</kbd></button>
+        <button id="btn-pause"><span class="label">暂停</span><kbd>P</kbd></button>
+        <button id="btn-reset"><span class="label">重置场景</span></button>
+      </nav>
+    </div>
+
+    <div id="intro" class="intro">
+      <div class="intro-card">
+        <div class="brand"><span class="brand-dot"></span>FULL SELF-DRIVING · 模拟</div>
+        <h1>FSD 城市自动驾驶模拟器</h1>
+        <p class="lead">
+          在一个 5×5 路口的城市中，车辆自主完成路线规划、车道保持、变道、红绿灯通行、跟车、礼让行人与绕行故障车辆。你可以随时设置目的地、制造突发状况，或接管方向盘。
+        </p>
+        <div class="intro-grid">
+          <div>
+            <h3>自动驾驶</h3>
+            <ul>
+              <li>点击小地图或路面设置目的地</li>
+              <li><kbd>F</kbd> 启用 / 退出 FSD</li>
+              <li><kbd>J</kbd> 生成横穿行人，<kbd>B</kbd> 生成故障车辆</li>
+            </ul>
+          </div>
+          <div>
+            <h3>手动驾驶</h3>
+            <ul>
+              <li><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 或方向键驾驶，<kbd>空格</kbd> 制动</li>
+              <li>FSD 启用时按下驾驶键即视为接管</li>
+              <li><kbd>C</kbd> 切换视角，<kbd>T</kbd> 加速模拟，<kbd>P</kbd> 暂停</li>
+            </ul>
+          </div>
+        </div>
+        <button id="btn-start" class="start">开始体验</button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -79,17 +79,17 @@ interface PhaseDef {
 }
 
 export const PHASES: readonly PhaseDef[] = [
-  { name: "NS_THRU", dur: 9 },
+  { name: "NS_THRU", dur: 8 },
   { name: "NS_THRU_Y", dur: 2.5 },
-  { name: "NS_LEFT", dur: 5 },
+  { name: "NS_LEFT", dur: 4.5 },
   { name: "NS_LEFT_Y", dur: 2 },
   { name: "ALL_RED", dur: 1 },
-  { name: "EW_THRU", dur: 9 },
+  { name: "EW_THRU", dur: 8 },
   { name: "EW_THRU_Y", dur: 2.5 },
-  { name: "EW_LEFT", dur: 5 },
+  { name: "EW_LEFT", dur: 4.5 },
   { name: "EW_LEFT_Y", dur: 2 },
   { name: "ALL_RED", dur: 1 },
-  { name: "PED", dur: 10 },
+  { name: "PED", dur: 9 },
   { name: "ALL_RED", dur: 1.5 },
 ];
 export const CYCLE = PHASES.reduce((a, p) => a + p.dur, 0);

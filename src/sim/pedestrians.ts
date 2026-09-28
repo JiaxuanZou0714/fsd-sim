@@ -1,5 +1,5 @@
-import type { Agent } from "./agents";
-import { Rng, type Vec2, add, dist, norm, scale, sub, vec } from "./geometry";
+import { type Agent, CAR_CIRCLE_R, PED_R, carCircles } from "./agents";
+import { Rng, type Vec2, add, dist, dist2, norm, scale, sub, vec } from "./geometry";
 import { CORNER, type Edge, GRID, SIDEWALK, World } from "./world";
 
 type PedState = "wait" | "walk" | "cross" | "jaywalk" | "done";
@@ -33,11 +33,14 @@ export class Pedestrian implements Agent {
   jitter: Vec2;
   /** Walk-cycle phase for animation. */
   gait = 0;
+  blockedTime = 0;
+  origin: Vec2;
   readonly jaywalker: boolean;
   readonly tone: number;
 
   constructor(pos: Vec2, corner: CornerRef, state: PedState, speed: number, jitter: Vec2, tone: number, jaywalker: boolean) {
     this.pos = pos;
+    this.origin = pos;
     this.corner = corner;
     this.state = state;
     this.target = pos;
@@ -110,8 +113,8 @@ export class Pedestrians {
     return this.rng.pick(options);
   }
 
-  update(dt: number, t: number, targetCount: number): void {
-    for (const ped of this.peds) this.step(ped, dt, t);
+  update(dt: number, t: number, targetCount: number, vehicles: readonly Agent[]): void {
+    for (const ped of this.peds) this.step(ped, dt, t, vehicles);
     for (let i = this.peds.length - 1; i >= 0; i--) {
       if ((this.peds[i] as Pedestrian).state === "done") this.peds.splice(i, 1);
     }
@@ -123,7 +126,20 @@ export class Pedestrians {
     }
   }
 
-  private step(ped: Pedestrian, dt: number, t: number): void {
+  /** True when walking one more metre along `dir` would bring the pedestrian into contact with a vehicle. */
+  private blockedByVehicle(ped: Pedestrian, dir: Vec2, vehicles: readonly Agent[]): boolean {
+    const probe = add(ped.pos, dir);
+    const clearance = CAR_CIRCLE_R + PED_R + 0.35;
+    for (const v of vehicles) {
+      if (dist2(v.pos, ped.pos) > 49) continue;
+      for (const c of carCircles(v.pos, v.heading)) {
+        if (dist(c, probe) < clearance && dist(c, probe) < dist(c, ped.pos)) return true;
+      }
+    }
+    return false;
+  }
+
+  private step(ped: Pedestrian, dt: number, t: number, vehicles: readonly Agent[]): void {
     if (ped.state === "wait") {
       ped.v = 0;
       ped.vel = vec(0, 0);
@@ -156,6 +172,26 @@ export class Pedestrians {
       return;
     }
     const dir = norm(delta);
+    if (this.blockedByVehicle(ped, dir, vehicles)) {
+      ped.v = 0;
+      ped.vel = vec(0, 0);
+      ped.blockedTime += dt;
+      if (ped.blockedTime > 4) {
+        // A vehicle is waiting for this pedestrian while blocking the way; turn back.
+        ped.blockedTime = 0;
+        if (ped.state === "jaywalk") {
+          const back = ped.origin;
+          ped.origin = ped.target;
+          ped.target = back;
+        } else {
+          ped.plan = { kind: "walk", to: ped.corner, needsSignal: false };
+          ped.state = "walk";
+          ped.target = this.cornerPos(ped.corner, ped.jitter);
+        }
+      }
+      return;
+    }
+    ped.blockedTime = 0;
     const stepLen = Math.min(d, speed * dt);
     ped.pos = add(ped.pos, scale(dir, stepLen));
     ped.v = speed;

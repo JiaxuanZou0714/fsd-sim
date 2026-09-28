@@ -144,7 +144,7 @@ export class Traffic {
     const next = this.rng.pick(weighted);
     const turn = turnOf(edgeSeg.edge.dir, next.dir) as Turn;
     edgeSeg.turn = turn;
-    const nextLane = turn === "left" ? 1 : turn === "right" ? 0 : lane;
+    const nextLane = lane;
     const conn: Seg = {
       poly: this.world.connector(edgeSeg.edge, lane, next, nextLane),
       kind: "conn",

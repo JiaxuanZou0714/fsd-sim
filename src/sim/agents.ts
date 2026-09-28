@@ -61,6 +61,8 @@ export function scanPath(samples: PathSample[], agents: readonly Agent[], opts: 
   for (const a of agents) {
     if (a.id === opts.selfId) continue;
     if (dist2(a.pos, first.p) > reach2) continue;
+    // Agents behind the scanning vehicle are its followers' concern; ignoring them breaks mutual waits.
+    if ((a.pos.x - first.p.x) * first.dir.x + (a.pos.y - first.p.y) * first.dir.y < -0.5) continue;
     const isPed = a.kind === "ped";
     const probes: Vec2[] = isPed ? [a.pos] : carCircles(a.pos, a.heading);
     const radius = isPed ? PED_R + opts.tube + opts.pedMargin : CAR_CIRCLE_R + opts.tube;
