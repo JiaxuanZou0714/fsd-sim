@@ -1,16 +1,16 @@
-import { type Agent, CAR_CIRCLE_R, PED_R, carCircles } from "./agents";
+import { type Agent, agentCircles, agentRadius, footprint } from "./agents";
 import { type Destination, Ego, type ManualInput } from "./ego";
-import { Rng, type Vec2, clamp, dist, dist2 } from "./geometry";
+import { Rng, type Vec2, angleOf, dist, dist2, wrapAngle } from "./geometry";
+import { PARIS_ETOILE } from "./map/mapData";
+import { type Lane, RoadNetwork } from "./map/network";
 import { Pedestrians } from "./pedestrians";
-import { type Occupant, Traffic } from "./traffic";
-import { type Edge, World, angleOfDir, laneOffset, turnOf } from "./world";
+import { Predictor } from "./planner/prediction";
+import { Traffic } from "./traffic";
 
 export interface SimSettings {
   trafficCount: number;
   pedCount: number;
-  /** Automatically pick a new destination after arriving. */
   autoplay: boolean;
-  /** Periodically script jaywalkers and stalled vehicles ahead of the ego car. */
   randomEvents: boolean;
 }
 
@@ -28,22 +28,33 @@ export interface SimStats {
   collisions: number;
   arrivals: number;
   emergencyStops: number;
+  recoveries: number;
+  planMs: number;
 }
 
 export const DEFAULT_SETTINGS: SimSettings = {
-  trafficCount: 34,
-  pedCount: 40,
+  trafficCount: 75,
+  pedCount: 70,
   autoplay: true,
   randomEvents: true,
 };
 
 const NO_INPUT: ManualInput = { throttle: 0, brake: 0, steer: 0 };
 
+let sharedNetwork: RoadNetwork | null = null;
+
+/** The road network is immutable, so it is built once and shared between simulations. */
+export function getNetwork(): RoadNetwork {
+  if (!sharedNetwork) sharedNetwork = new RoadNetwork(PARIS_ETOILE);
+  return sharedNetwork;
+}
+
 export class Simulation {
-  readonly world: World;
+  readonly net: RoadNetwork;
   readonly traffic: Traffic;
   readonly peds: Pedestrians;
   readonly ego: Ego;
+  readonly predictor: Predictor;
   readonly rng: Rng;
   readonly settings: SimSettings;
   readonly stats: SimStats = {
@@ -53,31 +64,47 @@ export class Simulation {
     collisions: 0,
     arrivals: 0,
     emergencyStops: 0,
+    recoveries: 0,
+    planMs: 0,
   };
+  /** Lanes from which every other lane in the set is reachable (the main strongly connected part). */
+  readonly core: Lane[];
   t = 0;
   private pending: SimEvent[] = [];
   private contacts = new Set<number>();
-  private nextScriptedEvent = 18;
+  private nextScripted = 20;
   private arrivedAt = -1;
   private lastIntent = "";
+  private lastFsd = "lane";
 
   constructor(seed = 7, settings: Partial<SimSettings> = {}) {
     this.rng = new Rng(seed);
     this.settings = { ...DEFAULT_SETTINGS, ...settings };
-    this.world = new World();
-    this.traffic = new Traffic(this.world, this.rng);
-    this.peds = new Pedestrians(this.world, this.rng);
+    this.net = getNetwork();
+    this.core = [...this.net.core].filter((l) => l.poly.length > 6);
+    this.traffic = new Traffic(this.net, this.rng, this.settings.trafficCount);
+    this.peds = new Pedestrians(this.net, this.rng, this.settings.pedCount);
+    this.predictor = new Predictor(this.net);
 
-    const startEdge = this.world.edge(this.world.node(2 * 5 + 1).out[0] as number);
-    const startPos = this.world.lanePoint(startEdge, laneOffset(0), 18);
-    this.ego = new Ego(startPos, angleOfDir(startEdge.dir));
+    const start = this.startLane();
+    const p = start.poly.sampleAt(12);
+    this.ego = new Ego(p.p, angleOf(p.dir));
 
-    for (let i = 0; i < this.settings.trafficCount; i++) this.traffic.spawnRandom([startPos], 25);
-    for (let i = 0; i < this.settings.pedCount; i++) this.peds.spawnWalker();
+    for (let i = 0; i < this.settings.trafficCount; i++) this.traffic.spawnRandom([this.ego.pos], 18);
+    for (let i = 0; i < this.settings.pedCount; i++) {
+      if (this.rng.chance(0.5)) this.peds.spawnAtCrossing(null);
+      else this.peds.spawnStroller();
+    }
+  }
+
+  private startLane(): Lane {
+    const candidates = this.core.filter((l) => l.road.rank >= 5 && !l.road.circular && l.poly.length > 60 && l.k === 0);
+    candidates.sort((a, b) => dist(a.poly.pts[0], { x: 0, y: 0 }) - dist(b.poly.pts[0], { x: 0, y: 0 }));
+    return candidates[Math.min(candidates.length - 1, 3)] ?? this.core[0];
   }
 
   get agents(): Agent[] {
-    return [this.ego, ...this.traffic.cars, ...this.peds.peds];
+    return [this.ego, ...this.traffic.vehicles, ...this.peds.peds];
   }
 
   drainEvents(): SimEvent[] {
@@ -90,46 +117,43 @@ export class Simulation {
     this.pending.push({ text, level });
   }
 
-  /** Destination on the lane closest to a world point. */
-  destinationNear(p: Vec2): Destination {
+  // ---------------------------------------------------------------------------
+  // Destinations and modes
+
+  destinationNear(p: Vec2): Destination | null {
+    const core = new Set(this.core);
     let best: Destination | null = null;
     let bestD = Infinity;
-    for (const e of this.world.edges) {
-      const u = clamp(this.world.edgeCoord(e, p), 6, e.length - 6);
-      const q = this.world.lanePoint(e, 3.5, u);
-      const d = dist2(p, q);
-      if (d < bestD) {
-        bestD = d;
-        best = { edge: e, u, pos: this.world.lanePoint(e, laneOffset(0), u) };
+    for (const e of this.net.nearest(p, 80)) {
+      const l = e.lane;
+      if (!l || !core.has(l)) continue;
+      if (e.d < bestD) {
+        bestD = e.d;
+        const s = Math.min(l.poly.length - 3, Math.max(3, e.s));
+        best = { lane: l, s, pos: l.poly.sampleAt(s).p };
       }
     }
-    if (!best) throw new Error("World has no edges");
     return best;
   }
 
   randomDestination(): Destination {
-    for (let i = 0; i < 30; i++) {
-      const e = this.rng.pick(this.world.edges);
-      const u = this.rng.range(10, e.length - 10);
-      const pos = this.world.lanePoint(e, laneOffset(0), u);
+    for (let i = 0; i < 60; i++) {
+      const l = this.rng.pick(this.core);
+      if (l.poly.length < 25) continue;
+      const s = this.rng.range(8, l.poly.length - 8);
+      const pos = l.poly.sampleAt(s).p;
       const d = dist(pos, this.ego.pos);
-      if (d > 140 && d < 380) return { edge: e, u, pos };
+      if (d > 220 && d < 650) return { lane: l, s, pos };
     }
-    const e = this.rng.pick(this.world.edges);
-    return { edge: e, u: e.length / 2, pos: this.world.lanePoint(e, laneOffset(0), e.length / 2) };
+    const l = this.core[0];
+    return { lane: l, s: l.poly.length / 2, pos: l.poly.sampleAt(l.poly.length / 2).p };
   }
 
-  /** Returns an error message if FSD could not engage. */
-  engageFsd(dest?: Destination): string | null {
+  engageFsd(dest?: Destination): void {
     const target = dest ?? this.ego.dest ?? this.randomDestination();
-    const err = this.ego.engage(this.world, target);
-    if (err) {
-      this.emit(err, "warn");
-      return err;
-    }
+    this.ego.engage(this.net, target);
     this.arrivedAt = -1;
-    this.emit("FSD 已启用，正在前往目的地", "info");
-    return null;
+    this.emit(this.ego.fsd === "lane" ? "FSD 已启用，正在前往目的地" : "FSD 已启用：车辆不在车道上，正在规划返回道路的路径", "info");
   }
 
   setDestination(dest: Destination): void {
@@ -147,84 +171,135 @@ export class Simulation {
     this.emit("驾驶员接管，FSD 已退出", "warn");
   }
 
-  /** Where the ego car is along the road network, preferring the active route. */
-  private egoAnchor(): { edge: Edge; u: number; lane: number; next: Edge | null } | null {
+  // ---------------------------------------------------------------------------
+  // Scripted situations
+
+  /** Lane and arc length on the ego's reference roughly `ahead` metres in front. */
+  private pointAhead(ahead: number): { lane: Lane; s: number } | null {
     const ego = this.ego;
-    if (ego.mode === "fsd" && ego.route.length > 0) {
-      const edge = ego.route[ego.routeIdx] as Edge;
-      return { edge, u: this.world.edgeCoord(edge, ego.pos), lane: ego.lane, next: ego.route[ego.routeIdx + 1] ?? null };
+    if (ego.mode === "fsd" && ego.ref && ego.plan) {
+      const ref = ego.ref;
+      for (let s = ego.plan.s0 + ahead; s < Math.min(ref.poly.length, ego.plan.s0 + ahead + 40); s += 2) {
+        const laneId = ref.lane[ref.index(s)];
+        if (laneId < 0) continue;
+        const lane = this.net.lanes[laneId];
+        const ls = lane.poly.project(ref.poly.sampleAt(s).p).s;
+        if (ls > 6 && ls < lane.poly.length - 8) return { lane, s: ls };
+      }
+      return null;
     }
-    const loc = ego.localize(this.world);
+    const loc = ego.localize(this.net);
     if (!loc) return null;
-    const succ = this.world.successors(loc.edge).filter((e) => turnOf(loc.edge.dir, e.dir) === "straight");
-    return { edge: loc.edge, u: loc.u, lane: loc.lane, next: succ[0] ?? null };
+    const s = loc.s + ahead;
+    return s < loc.lane.poly.length - 8 ? { lane: loc.lane, s } : null;
   }
 
   spawnJaywalkerAhead(): boolean {
-    const anchor = this.egoAnchor();
-    if (!anchor) return false;
-    const ahead = Math.max(26, this.ego.v * 2.8 + 6);
-    let edge = anchor.edge;
-    let u = anchor.u + ahead;
-    if (u > edge.length - 3) {
-      if (!anchor.next) return false;
-      u = u - edge.length + 2;
-      edge = anchor.next;
-      if (u > edge.length - 3) return false;
-    }
-    this.peds.spawnJaywalker(edge, u, this.rng.chance(0.6));
+    const at = this.pointAhead(Math.max(24, this.ego.v * 2.8 + 6));
+    if (!at) return false;
+    this.peds.spawnJaywalker(at.lane, at.s, this.rng.chance(0.6));
     this.emit("前方行人横穿马路", "warn");
     return true;
   }
 
   spawnStalledAhead(): boolean {
-    const anchor = this.egoAnchor();
-    if (!anchor) return false;
-    const lane = anchor.lane;
-    let edge = anchor.edge;
-    let u = anchor.u + Math.max(40, this.ego.v * 4);
-    if (u > edge.length - 10) {
-      if (!anchor.next) return false;
-      edge = anchor.next;
-      u = 26;
-    }
-    const p = this.world.lanePoint(edge, laneOffset(lane), u);
-    if (this.traffic.cars.some((c) => dist(c.pos, p) < 9)) return false;
-    if (this.traffic.cars.some((c) => c.stalled && c.seg.edge.id === edge.id)) return false;
-    const dest = this.ego.dest;
-    if (dest && dest.edge.id === edge.id && Math.abs(dest.u - u) < 20) return false;
-    this.traffic.spawnOnEdge(edge, lane, u, true);
-    this.emit("前方车辆故障停驶", "warn");
+    const at = this.pointAhead(Math.max(38, this.ego.v * 4));
+    if (!at) return false;
+    const p = at.lane.poly.sampleAt(at.s).p;
+    if (this.traffic.vehicles.some((c) => dist(c.pos, p) < 10)) return false;
+    const car = this.traffic.spawn(at.lane, at.s, this.rng.chance(0.5) ? "van" : "car", true);
+    car.syncPose();
+    this.emit(car.vkind === "van" ? "前方货车违停" : "前方车辆故障停驶", "warn");
     return true;
   }
 
+  spawnCyclistAhead(): boolean {
+    const at = this.pointAhead(Math.max(30, this.ego.v * 3));
+    if (!at) return false;
+    const lane = at.lane.road.lanes[0];
+    const s = Math.min(lane.poly.length - 8, at.s);
+    const p = lane.poly.sampleAt(s).p;
+    if (this.traffic.vehicles.some((c) => dist(c.pos, p) < 8)) return false;
+    this.traffic.spawn(lane, s, "bike");
+    this.emit("前方有自行车", "info");
+    return true;
+  }
+
+  /** Teleports the ego to a random spot off the carriageway (courtyard, sidewalk, plaza). */
+  placeOffRoad(): boolean {
+    const g = this.net.grid;
+    for (let i = 0; i < 400; i++) {
+      const lane = this.rng.pick(this.core);
+      const smp = lane.poly.sampleAt(this.rng.range(0, lane.poly.length));
+      const ang = this.rng.range(0, Math.PI * 2);
+      const r = this.rng.range(9, 28);
+      const p = { x: smp.p.x + Math.cos(ang) * r, y: smp.p.y + Math.sin(ang) * r };
+      if (g.onRoad(p) || !g.inside(p, 30)) continue;
+      const h = this.rng.range(-Math.PI, Math.PI);
+      if (footprint(p, h, this.ego.length + 1, this.ego.width + 0.8).some((c) => g.clearanceAt(c) < 1.6)) continue;
+      if (this.agents.some((a) => a.id !== 0 && dist(a.pos, p) < 6)) continue;
+      this.teleport(p, h);
+      this.emit("车辆已放置在非道路区域", "info");
+      return true;
+    }
+    return false;
+  }
+
+  /** Places the ego on a one-way street facing against traffic. */
+  placeWrongWay(): boolean {
+    const lanes = this.core.filter((l) => l.road.seg.oneway && l.poly.length > 40 && !l.road.circular);
+    for (let i = 0; i < 60; i++) {
+      const l = this.rng.pick(lanes);
+      const s = this.rng.range(12, l.poly.length - 12);
+      const smp = l.poly.sampleAt(s);
+      if (this.agents.some((a) => a.id !== 0 && dist(a.pos, smp.p) < 18)) continue;
+      this.teleport(smp.p, wrapAngle(angleOf(smp.dir) + Math.PI));
+      this.emit("车辆已放置在单行道上且方向与车流相反", "info");
+      return true;
+    }
+    return false;
+  }
+
+  private teleport(p: Vec2, h: number): void {
+    const ego = this.ego;
+    ego.pos = p;
+    ego.heading = h;
+    ego.v = 0;
+    ego.steer = 0;
+    ego.accel = 0;
+    this.contacts.clear();
+    if (ego.mode === "fsd") this.engageFsd(ego.dest ?? undefined);
+  }
+
+  // ---------------------------------------------------------------------------
+
   step(dt: number, manual: ManualInput = NO_INPUT): void {
     this.t += dt;
+    const ego = this.ego;
+    this.traffic.targetCount = this.settings.trafficCount;
+    this.peds.targetCount = this.settings.pedCount;
+    this.traffic.update(dt, this.t, this.agents, ego.pos, ego.exposure());
+    this.peds.update(dt, this.t, [ego, ...this.traffic.vehicles], ego.pos);
     const agents = this.agents;
-    const loc = this.ego.localize(this.world);
-    const egoOcc: Occupant[] = loc
-      ? [{ id: this.ego.id, edgeId: loc.edge.id, lane: loc.lane, u: loc.u, v: this.ego.v, obstruction: false }]
-      : [];
-    this.traffic.update(dt, this.t, agents, this.ego.pos, this.settings.trafficCount, egoOcc);
-    this.peds.update(dt, this.t, this.settings.pedCount, [this.ego, ...this.traffic.cars]);
+    this.predictor.observe(agents, this.t);
 
-    const before = this.ego.pos;
-    const wasFsd = this.ego.mode === "fsd";
-    this.ego.update(dt, { world: this.world, traffic: this.traffic, agents: this.agents, t: this.t }, manual);
-    const moved = dist(before, this.ego.pos);
+    const before = ego.pos;
+    const wasFsd = ego.mode === "fsd";
+    ego.update(dt, { net: this.net, traffic: this.traffic, predictor: this.predictor, agents, t: this.t }, manual);
+    if (ego.plan) this.stats.planMs = this.stats.planMs * 0.95 + ego.plan.ms * 0.05;
+    const moved = dist(before, ego.pos);
     if (wasFsd) this.stats.fsdDistance += moved;
     else this.stats.manualDistance += moved;
 
-    if (wasFsd && this.ego.mode === "manual" && this.ego.offRoute) {
-      this.ego.offRoute = false;
-      this.stats.interventions++;
-      this.emit("偏离路线过远，FSD 已退出", "danger");
+    if (ego.intent === "emergency" && this.lastIntent !== "emergency") this.stats.emergencyStops++;
+    this.lastIntent = ego.intent;
+    if (ego.mode === "fsd" && (this.lastFsd === "free" || this.lastFsd === "blocked") && ego.fsd === "lane") {
+      this.stats.recoveries++;
+      this.emit("已回到道路，切换为车道行驶", "success");
     }
+    this.lastFsd = ego.fsd;
 
-    if (this.ego.intent === "emergency" && this.lastIntent !== "emergency") this.stats.emergencyStops++;
-    this.lastIntent = this.ego.intent;
-
-    if (this.ego.mode === "fsd" && this.ego.arrived) {
+    if (ego.mode === "fsd" && ego.arrived) {
       if (this.arrivedAt < 0) {
         this.arrivedAt = this.t;
         this.stats.arrivals++;
@@ -234,31 +309,31 @@ export class Simulation {
       }
     }
 
-    if (this.settings.randomEvents && this.ego.mode === "fsd" && this.t > this.nextScriptedEvent && this.ego.v > 6) {
-      const ok = this.rng.chance(0.6) ? this.spawnJaywalkerAhead() : this.spawnStalledAhead();
-      this.nextScriptedEvent = this.t + (ok ? this.rng.range(30, 50) : 4);
+    if (this.settings.randomEvents && ego.mode === "fsd" && ego.fsd === "lane" && this.t > this.nextScripted && ego.v > 5) {
+      const r = this.rng.next();
+      const ok = r < 0.4 ? this.spawnJaywalkerAhead() : r < 0.7 ? this.spawnStalledAhead() : this.spawnCyclistAhead();
+      this.nextScripted = this.t + (ok ? this.rng.range(25, 45) : 4);
     }
 
     this.detectCollisions();
   }
 
   private detectCollisions(): void {
-    const egoCircles = carCircles(this.ego.pos, this.ego.heading);
+    const ego = this.ego;
+    const mine = footprint(ego.pos, ego.heading, ego.length, ego.width);
+    const r = ego.width / 2;
     const touching = new Set<number>();
-    for (const car of this.traffic.cars) {
-      if (dist2(car.pos, this.ego.pos) > 36) continue;
-      const cc = carCircles(car.pos, car.heading);
-      if (egoCircles.some((a) => cc.some((b) => dist(a, b) < CAR_CIRCLE_R * 2 - 0.12))) touching.add(car.id);
+    for (const a of [...this.traffic.vehicles, ...this.peds.peds]) {
+      if (dist2(a.pos, ego.pos) > 100) continue;
+      const ar = agentRadius(a);
+      if (mine.some((m) => agentCircles(a).some((c) => dist(m, c) < r + ar - 0.12))) touching.add(a.id);
     }
-    for (const ped of this.peds.peds) {
-      if (dist2(ped.pos, this.ego.pos) > 16) continue;
-      if (egoCircles.some((a) => dist(a, ped.pos) < CAR_CIRCLE_R + PED_R - 0.05)) touching.add(ped.id);
-    }
+    if (ego.bumped) touching.add(-1);
     for (const id of touching) {
       if (this.contacts.has(id)) continue;
       this.stats.collisions++;
-      this.ego.v = 0;
-      this.emit(id >= 10000 ? "碰撞：与行人发生接触" : "碰撞：与车辆发生接触", "danger");
+      ego.v = 0;
+      this.emit(id === -1 ? "碰撞：与建筑物发生接触" : id >= 100000 ? "碰撞：与行人发生接触" : "碰撞：与车辆发生接触", "danger");
     }
     this.contacts = touching;
   }

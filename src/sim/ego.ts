@@ -1,63 +1,40 @@
-import {
-  type Agent,
-  CAR_HALF_LEN,
-  IDM_DEFAULT,
-  type IdmParams,
-  type Obstacle,
-  curvatureSpeed,
-  idmAccel,
-  idmFree,
-  scanPath,
-} from "./agents";
-import {
-  Polyline,
-  type PathSample,
-  type Vec2,
-  add,
-  angleOf,
-  clamp,
-  cross,
-  dist,
-  dot,
-  fromAngle,
+import { type Agent, footprint } from "./agents";
+import { Polyline, type Vec2, add, angleOf, clamp, cross, dist, dot, fromAngle, scale, sub, wrapAngle } from "./geometry";
+import type { Connector, Lane, RoadNetwork } from "./map/network";
+import { type FreePathPoint, hybridAStar, splitByDirection } from "./planner/hybridAstar";
+import { LatticePlanner, type Plan } from "./planner/lattice";
+import { PRED_DT, type Predictor } from "./planner/prediction";
+import { type Reference, buildReference } from "./planner/reference";
+import { type RouteStep, goalForPoint, planRoute } from "./planner/route";
+import type { EgoExposure, Occupant, Traffic } from "./traffic";
 
-  scale,
-  smoothstep,
-  wrapAngle,
-} from "./geometry";
-import { planRoute } from "./routing";
-import type { NpcCar, Traffic } from "./traffic";
-import {
-  DIRS,
-  type Edge,
-  SPEED_LIMIT,
-  type SignalColor,
-  type Turn,
-  World,
-  laneOffset,
-  requiredLane,
-  turnOf,
-} from "./world";
-
-export const WHEELBASE = 2.9;
+export const WHEELBASE = 2.85;
 const MAX_STEER = 0.6;
+const MAX_CURVATURE = Math.tan(MAX_STEER) / WHEELBASE;
 
 export type DriveMode = "manual" | "fsd";
+export type FsdState = "lane" | "free" | "blocked" | "arrived";
 
-export type IntentKind =
+export type Intent =
   | "manual"
   | "cruise"
-  | "curve"
   | "follow"
-  | "light"
-  | "yellow"
   | "ped"
+  | "bike"
+  | "yield"
   | "obstacle"
-  | "lanechange"
-  | "waitlane"
+  | "red"
+  | "yellow"
+  | "curve"
   | "arriving"
   | "arrived"
-  | "emergency";
+  | "emergency"
+  | "freespace"
+  | "reverse"
+  | "searching"
+  | "noroute";
+
+export type LateralIntent = "keep" | "lanechange" | "overtake" | "nudge";
 
 export interface ManualInput {
   throttle: number;
@@ -65,76 +42,75 @@ export interface ManualInput {
   steer: number;
 }
 
-export interface StopMarker {
+export interface Destination {
+  lane: Lane;
   s: number;
-  node: number;
-  dirIn: number;
-  turn: Turn;
-  ri: number;
   pos: Vec2;
-  dir: Vec2;
 }
 
 export interface DriveContext {
-  world: World;
+  net: RoadNetwork;
   traffic: Traffic;
+  predictor: Predictor;
   agents: readonly Agent[];
   t: number;
 }
 
-export interface Destination {
-  edge: Edge;
-  u: number;
-  pos: Vec2;
+interface FreeManeuver {
+  path: FreePathPoint[];
+  runs: { poly: Polyline; dir: number }[];
+  run: number;
+  goalLane: Lane | null;
 }
-
-export interface Localization {
-  edge: Edge;
-  lane: number;
-  u: number;
-}
-
-const PATH_KIND_EDGE = 0;
-const PATH_KIND_CONN = 1;
-const PATH_KIND_LC = 2;
 
 export class Ego implements Agent {
   readonly id = 0;
-  readonly kind = "car" as const;
+  readonly kind = "vehicle" as const;
+  readonly vkind = "car" as const;
+  readonly length = 4.7;
+  readonly width = 1.9;
   pos: Vec2;
   heading: number;
   v = 0;
   vel: Vec2 = { x: 0, y: 0 };
   steer = 0;
   accel = 0;
-  mode: DriveMode = "manual";
-
-  route: Edge[] = [];
-  routeIdx = 0;
-  lane = 0;
-  dest: Destination | null = null;
-
-  path: Polyline | null = null;
-  private pathRi: number[] = [];
-  private pathLane: number[] = [];
-  private pathKind: number[] = [];
-  stops: StopMarker[] = [];
-  destS = 0;
-  pathS = 0;
-  private pathIdx = 0;
-  lcEndS = -1;
-  lcTarget = -1;
-  private lcFrom = 0;
-  private lcBlockedTime = 0;
-  private lcCooldown = 0;
-  private committedStopRi = -1;
-
-  intent: IntentKind = "manual";
-  leadId = -1;
-  activeStop: { marker: StopMarker; color: SignalColor } | null = null;
   blinker = 0;
+  mode: DriveMode = "manual";
+  fsd: FsdState = "lane";
+
+  dest: Destination | null = null;
+  route: RouteStep[] | null = null;
+  ref: Reference | null = null;
+  plan: Plan | null = null;
+  planPath: Polyline | null = null;
+  private planAge = 0;
+  private planTimer = 0;
+  private routeTimer = 0;
+  private refHint = 0;
+  private routeKey = "";
+  private blockedTimer = 0;
+  private prevDT: number | null = null;
+  private staticBlockTime = 0;
+  private freeHazardTime = 0;
+  private noRouteTime = 0;
+  private freeExclude: Lane | null = null;
+  free: FreeManeuver | null = null;
+  private lastLoc: { lane: Lane; s: number } | null = null;
+  private lastConn: { conn: Connector; s: number } | null = null;
+  private lastAgents: readonly Agent[] = [];
+  private freeAheadOnly = false;
+  /** Why free-space driving was last entered (diagnostics). */
+  freeReason = "";
+
+  intent: Intent = "manual";
+  lateral: LateralIntent = "keep";
+  leadId = -1;
   arrived = false;
-  offRoute = false;
+  bumped = false;
+  message = "";
+
+  private readonly lattice = new LatticePlanner();
 
   constructor(pos: Vec2, heading: number) {
     this.pos = pos;
@@ -145,175 +121,111 @@ export class Ego implements Agent {
     return fromAngle(this.heading);
   }
 
-  /** Matches the vehicle pose to a lane whose direction agrees with the heading. */
-  localize(world: World): Localization | null {
-    let best: Localization | null = null;
-    let bestScore = Infinity;
-    for (const e of world.edges) {
-      const d = DIRS[e.dir] as Vec2;
-      if (dot(d, this.fwd) < 0.6) continue;
-      const u = world.edgeCoord(e, this.pos);
-      if (u < -16 || u > e.length + 2) continue;
-      const lat = world.lateralCoord(e, this.pos);
-      if (lat < -1.5 || lat > 8.5) continue;
-      const lane = lat < 3.5 ? 1 : 0;
-      const outside = u < 0 ? -u : 0;
-      const score = Math.abs(lat - laneOffset(lane)) + outside * 0.6;
-      if (score < bestScore) {
-        bestScore = score;
-        best = { edge: e, lane, u };
-      }
-    }
-    return best;
-  }
+  // ---------------------------------------------------------------------------
+  // Mode changes
 
-  /** Engages FSD towards `dest`. Returns an error message on failure. */
-  engage(world: World, dest: Destination): string | null {
-    const loc = this.localize(world);
-    if (!loc) return "无法匹配车道，请先将车辆驶入车道并保持行驶方向";
-    const route = planRoute(world, loc.edge, Math.max(0, loc.u), dest.edge, dest.u);
-    if (!route) return "无法规划到目的地的路线";
-    this.route = route;
-    this.routeIdx = 0;
-    this.lane = loc.lane;
+  engage(net: RoadNetwork, dest: Destination): void {
     this.dest = dest;
     this.mode = "fsd";
     this.arrived = false;
-    this.offRoute = false;
-    this.committedStopRi = -1;
-    this.rebuildPath(world, null);
-    return null;
+    this.route = null;
+    this.ref = null;
+    this.plan = null;
+    this.free = null;
+    this.fsd = "lane";
+    this.routeKey = "";
+    this.planTimer = 0;
+    this.routeTimer = 0;
+    this.message = "";
+    if (!this.localize(net)) this.enterFree(net, false);
   }
 
   disengage(): void {
     this.mode = "manual";
     this.intent = "manual";
-    this.activeStop = null;
+    this.lateral = "keep";
+    this.plan = null;
+    this.planPath = null;
+    this.free = null;
     this.leadId = -1;
-    this.lcEndS = -1;
-    this.lcTarget = -1;
   }
 
-  /** Rebuilds the reference path from the current position; optionally starts a lane change now. */
-  rebuildPath(world: World, lcTarget: number | null): void {
-    const pts: Vec2[] = [];
-    const ri: number[] = [];
-    const lanes: number[] = [];
-    const kinds: number[] = [];
-    const push = (p: Vec2, r: number, l: number, k: number): void => {
-      const last = pts[pts.length - 1];
-      if (last && dist(last, p) < 0.05) return;
-      pts.push(p);
-      ri.push(r);
-      lanes.push(l);
-      kinds.push(k);
-    };
-    const pushLane = (e: Edge, r: number, lane: number, u0: number, u1Raw: number, step: number): void => {
-      const u1 = Math.max(u0, u1Raw);
-      for (let u = u0; u < u1; u += step) push(world.lanePoint(e, laneOffset(lane), u), r, lane, PATH_KIND_EDGE);
-      push(world.lanePoint(e, laneOffset(lane), u1), r, lane, PATH_KIND_EDGE);
-    };
-    const pushChange = (e: Edge, r: number, from: number, to: number, u0: number, u1: number): void => {
-      const o0 = laneOffset(from);
-      const o1 = laneOffset(to);
-      for (let u = u0; u <= u1; u += 0.5) {
-        const k = smoothstep((u - u0) / (u1 - u0));
-        push(world.lanePoint(e, o0 + (o1 - o0) * k, u), r, to, PATH_KIND_LC);
-      }
-    };
-
-    const lastIdx = this.route.length - 1;
-    const cur = this.route[this.routeIdx];
-    if (!cur) return;
-    const u0 = clamp(world.edgeCoord(cur, this.pos), 0, cur.length);
-    let lane = this.lane;
-    const endU = (i: number, e: Edge): number => (i === lastIdx && this.dest ? Math.min(e.length, this.dest.u + 14) : e.length);
-
-    let lcEndIndex = -1;
-    this.lcFrom = lane;
-    if (lcTarget !== null && lcTarget !== lane) {
-      const L = clamp(this.v * 2.6, 9, 30);
-      const u1 = Math.min(u0 + L, cur.length - 1);
-      pushChange(cur, this.routeIdx, lane, lcTarget, u0, u1);
-      lcEndIndex = pts.length - 1;
-      lane = lcTarget;
-      pushLane(cur, this.routeIdx, lane, u1 + 1, endU(this.routeIdx, cur), 1);
-    } else {
-      pushLane(cur, this.routeIdx, lane, u0, endU(this.routeIdx, cur), 1);
+  /** Lane (or junction connector) matching the current pose and direction of travel. */
+  localize(net: RoadNetwork): { lane: Lane; s: number } | null {
+    const m = net.matchLane(this.pos, this.heading, 2.9, 0.85);
+    if (m) {
+      this.lastLoc = { lane: m.lane, s: m.s };
+      this.lastConn = null;
+      return this.lastLoc;
     }
+    const c = net.matchConnector(this.pos, this.heading, 2.6, 0.85);
+    if (c) {
+      this.lastConn = c;
+      this.lastLoc = { lane: c.conn.to, s: 0 };
+      return this.lastLoc;
+    }
+    this.lastLoc = null;
+    this.lastConn = null;
+    return null;
+  }
 
-    const stopIdx: { idx: number; node: number; dirIn: number; turn: Turn; ri: number }[] = [];
-    for (let i = this.routeIdx; i < lastIdx; i++) {
-      const a = this.route[i] as Edge;
-      const b = this.route[i + 1] as Edge;
-      const turn = turnOf(a.dir, b.dir) as Turn;
-      stopIdx.push({ idx: pts.length - 1, node: a.to, dirIn: a.dir, turn, ri: i });
-      // Turns keep their lane: left from the inner lane, right from the outer lane, and a
-      // turn forced from the other lane stays parallel instead of merging.
-      const nextLane = lane;
-      const conn = world.connector(a, lane, b, nextLane);
-      for (const p of conn.pts) push(p, i, nextLane, PATH_KIND_CONN);
-      lane = nextLane;
-      const c = this.route[i + 2];
-      const need = c && i + 1 < lastIdx ? requiredLane(turnOf(b.dir, c.dir) as Turn) : null;
-      if (need !== null && need !== lane) {
-        pushLane(b, i + 1, lane, 0, 4, 1);
-        pushChange(b, i + 1, lane, need, 4.5, 26);
-        lane = need;
-        pushLane(b, i + 1, lane, 27, endU(i + 1, b), 1);
-      } else {
-        pushLane(b, i + 1, lane, 0, endU(i + 1, b), 1);
+  exposure(): EgoExposure {
+    let occupant: Occupant | null = null;
+    if (this.lastLoc) {
+      const u = this.lastConn ? this.lastConn.s - this.lastConn.conn.poly.length : this.lastLoc.s;
+      occupant = { id: this.id, lane: this.lastLoc.lane.id, u, v: this.v, length: this.length, obstruction: false };
+    }
+    const approaches: { conn: Connector; dStart: number }[] = [];
+    if (this.mode === "fsd" && this.ref && this.plan) {
+      const s0 = this.plan.s0;
+      for (const sp of this.ref.spans) {
+        const d = sp.s0 - s0;
+        if (d < -(sp.s1 - sp.s0) - 3 || d > 70) continue;
+        approaches.push({ conn: sp.conn, dStart: d });
       }
     }
+    return { agent: this, occupant, approaches };
+  }
 
-    const poly = new Polyline(pts);
-    this.path = poly;
-    this.pathRi = ri;
-    this.pathLane = lanes;
-    this.pathKind = kinds;
-    this.stops = stopIdx.map((m) => {
-      const s = poly.cum[m.idx] as number;
-      const smp = poly.sampleAt(s);
-      return { s, node: m.node, dirIn: m.dirIn, turn: m.turn, ri: m.ri, pos: smp.p, dir: smp.dir };
-    });
-    this.lcEndS = lcEndIndex >= 0 ? (poly.cum[lcEndIndex] as number) : -1;
-    this.lcTarget = lcEndIndex >= 0 ? lane : -1;
-    if (this.dest) {
-      const destPoint = world.lanePoint(this.route[lastIdx] as Edge, laneOffset(lane), this.dest.u);
-      this.destS = poly.project(destPoint).s;
+  // ---------------------------------------------------------------------------
+  // Update
+
+  update(dt: number, ctx: DriveContext, input: ManualInput): void {
+    this.bumped = false;
+    this.lastAgents = ctx.agents;
+    if (this.mode === "manual") {
+      this.localize(ctx.net);
+      this.updateManual(dt, input, ctx.net);
+      return;
     }
-    const proj = poly.project(this.pos, 0, 12);
-    this.pathS = proj.s;
-    this.pathIdx = proj.idx;
+    if (this.fsd === "free" || this.fsd === "blocked") this.updateFree(dt, ctx);
+    else this.updateLane(dt, ctx);
   }
 
-  private laneFree(ctx: DriveContext, e: Edge, lane: number, u: number): boolean {
-    if (!ctx.traffic.laneFree(e, lane, u, this.v, this.id)) return false;
-    for (const a of ctx.agents) {
-      if (a.kind !== "ped") continue;
-      const lat = ctx.world.lateralCoord(e, a.pos);
-      const du = ctx.world.edgeCoord(e, a.pos) - u;
-      if (du > -3 && du < 30 && Math.abs(lat - laneOffset(lane)) < 2.5) return false;
-    }
-    return true;
-  }
-
-  update(dt: number, ctx: DriveContext, manual: ManualInput): void {
-    if (this.mode === "manual") this.updateManual(dt, manual);
-    else this.updateFsd(dt, ctx);
-  }
-
-  /** Kinematic bicycle model referenced at the vehicle centre. */
-  private integrate(dt: number): void {
+  private integrate(dt: number, net: RoadNetwork): void {
     const beta = Math.atan(0.5 * Math.tan(this.steer));
+    const prevPos = this.pos;
+    const prevHeading = this.heading;
     const course = fromAngle(this.heading + beta);
     this.pos = add(this.pos, scale(course, this.v * dt));
     this.heading = wrapAngle(this.heading + (this.v / WHEELBASE) * Math.cos(beta) * Math.tan(this.steer) * dt);
     this.vel = scale(course, this.v);
+    // Buildings are solid.
+    for (const c of footprint(this.pos, this.heading, this.length, this.width)) {
+      if (net.grid.clearanceAt(c) < this.width / 2 - 0.1) {
+        this.pos = prevPos;
+        this.heading = prevHeading;
+        this.v = 0;
+        this.vel = { x: 0, y: 0 };
+        this.bumped = true;
+        break;
+      }
+    }
   }
 
-  private updateManual(dt: number, input: ManualInput): void {
+  private updateManual(dt: number, input: ManualInput, net: RoadNetwork): void {
     this.intent = "manual";
+    this.lateral = "keep";
     this.blinker = 0;
     let a = -0.25 - 0.004 * this.v * Math.abs(this.v);
     if (input.throttle > 0) a = this.v < -0.2 ? 6 : 3.2 * input.throttle;
@@ -329,219 +241,398 @@ export class Ego implements Agent {
     const target = input.steer * steerLimit;
     const rate = input.steer === 0 ? 2.4 : 1.6;
     this.steer += clamp(target - this.steer, -rate * dt, rate * dt);
-    this.integrate(dt);
+    this.integrate(dt, net);
   }
 
-  private nextStop(): StopMarker | null {
-    for (const m of this.stops) {
-      if (m.s - this.pathS - CAR_HALF_LEN > -1.0) return m;
+  // ---- Structured driving ------------------------------------------------------------------------
+
+  private replanRoute(net: RoadNetwork, loc: { lane: Lane; s: number }): void {
+    const dest = this.dest as Destination;
+    const route = planRoute(loc.lane, loc.s, goalForPoint(dest.lane, dest.s));
+    if (!route) {
+      this.route = null;
+      return;
     }
-    return null;
+    const key = route.map((r) => `${r.lane.id}${r.via[0]}`).join(",");
+    const refStale = !this.ref || !this.ref.lanesUsed.has(loc.lane) || (this.plan && Math.abs(this.plan.d0) > 4.5);
+    this.route = route;
+    if (key !== this.routeKey || refStale) {
+      this.routeKey = key;
+      const prefix = this.lastConn ? this.lastConn : null;
+      this.ref = buildReference(net, route, loc.s, this.v, dest);
+      if (prefix) this.ref = this.withConnectorPrefix(net, route, dest, prefix);
+      this.refHint = 0;
+      this.prevDT = null;
+    }
   }
 
-  private updateFsd(dt: number, ctx: DriveContext): void {
-    const { world } = ctx;
-    if (!this.path || !this.dest) {
+  /** Reference that starts on the connector the vehicle is currently in. */
+  private withConnectorPrefix(net: RoadNetwork, route: RouteStep[], dest: Destination, c: { conn: Connector; s: number }): Reference {
+    const conn = c.conn;
+    const fromLane = conn.from;
+    const steps: RouteStep[] = [{ lane: fromLane, sIn: fromLane.poly.length, via: "start", conn: null }, { ...route[0], via: "conn", conn }, ...route.slice(1)];
+    return buildReference(net, steps, fromLane.poly.length - 0.01, this.v, dest);
+  }
+
+  private updateLane(dt: number, ctx: DriveContext): void {
+    const { net } = ctx;
+    const dest = this.dest;
+    if (!dest) {
       this.disengage();
       return;
     }
-    let proj = this.path.project(this.pos, this.pathIdx, 30);
-    if (proj.dist > 7) {
-      const err = this.engage(world, this.dest);
-      if (err) {
-        this.offRoute = true;
-        this.disengage();
+    this.planTimer -= dt;
+    this.routeTimer -= dt;
+    if (this.planTimer <= 0) {
+      this.planTimer = 0.1;
+      let loc = this.localize(net);
+      let onGuide = true;
+      if (!loc) {
+        // Stay in lane mode while near the guide line (wide nudges, tight junction geometry).
+        const wide = net.matchLane(this.pos, this.heading, 4.2, 1.1);
+        const pr = this.ref?.poly.project(this.pos, this.refHint, 60);
+        const guideOk = !!pr && pr.dist < 5 && Math.abs(wrapAngle(angleOf(this.ref!.poly.sampleAt(pr.s).dir) - this.heading)) < 0.9;
+        if (wide) loc = this.lastLoc = { lane: wide.lane, s: wide.s };
+        else if (guideOk && this.lastLoc) {
+          loc = this.lastLoc;
+          onGuide = false;
+        }
+      }
+      if (!loc) {
+        this.enterFree(net, false);
         return;
       }
-      proj = (this.path as Polyline).project(this.pos, this.pathIdx, 30);
+      if (onGuide && (this.routeTimer <= 0 || !this.ref || !this.ref.lanesUsed.has(loc.lane))) {
+        this.routeTimer = 1;
+        this.replanRoute(net, loc);
+      }
+      if (!this.route || !this.ref) {
+        this.intent = "noroute";
+        this.message = "当前车道无法到达目的地，正在规划掉头路径";
+        this.noRouteTime += 0.1;
+        this.routeTimer = 0;
+        if (this.noRouteTime > 2 && this.v < 0.5) {
+          this.noRouteTime = 0;
+          this.enterFree(net, false, ctx.agents, loc.lane);
+          return;
+        }
+        this.brake(dt, net, 4);
+        return;
+      }
+      this.noRouteTime = 0;
+      const ref = this.ref;
+      const preds = ctx.predictor.predict(ctx.agents, this.id, this.pos, 85);
+      const plan = this.lattice.plan({
+        ref,
+        ego: { pos: this.pos, heading: this.heading, v: this.v, a: this.accel, length: this.length, width: this.width },
+        preds,
+        net,
+        signal: (g) => net.laneSignal(g.lane, ctx.t),
+        prevDT: this.prevDT,
+        hintIdx: this.refHint,
+      });
+      this.refHint = ref.index(plan.s0);
+      this.plan = plan;
+      this.prevDT = plan.dT;
+      this.planPath = new Polyline(plan.path);
+      this.planAge = 0;
+      this.explain(plan, ref);
+      // Stuck behind a stationary obstacle with no lateral option: manoeuvre in free space.
+      const blocker = plan.limitAgent;
+      const staticLimit = plan.limit === "static" || plan.limit === "building" || plan.limit === "curve" || plan.limit === "bike";
+      const parked = blocker ? this.looksParked(blocker, ctx) : true;
+      const blockedStatic = staticLimit && parked && this.v < 0.3;
+      this.staticBlockTime = blockedStatic ? this.staticBlockTime + 0.1 : 0;
+      const patience = blocker && blocker.blinker === 2 ? 5 : 10;
+      if (this.staticBlockTime > patience) {
+        this.staticBlockTime = 0;
+        this.enterFree(net, true);
+        this.message = "前方道路被占用，正在规划绕行路径";
+        return;
+      }
+      if ((ref.destS - plan.s0 < 3 || dist(this.pos, dest.pos) < 4) && this.v < 0.4) {
+        this.arrived = true;
+        this.fsd = "arrived";
+        this.intent = "arrived";
+      }
     }
-    this.pathS = proj.s;
-    this.pathIdx = proj.idx;
+    this.track(dt, net);
+  }
 
-    const kind = this.pathKind[proj.idx] ?? PATH_KIND_EDGE;
-    const ri = this.pathRi[proj.idx] ?? this.routeIdx;
-    if (kind !== PATH_KIND_CONN && ri > this.routeIdx) {
-      this.routeIdx = ri;
-      this.lane = this.pathLane[proj.idx] ?? this.lane;
-      this.rebuildPath(world, null);
-    } else if (kind !== PATH_KIND_CONN) {
-      this.lane = this.pathLane[proj.idx] ?? this.lane;
+  private explain(plan: Plan, ref: Reference): void {
+    this.leadId = plan.limitAgent?.id ?? -1;
+    const map: Record<Plan["limit"], Intent> = {
+      none: "cruise",
+      ped: "ped",
+      bike: "bike",
+      vehicle: "yield",
+      static: "obstacle",
+      follow: "follow",
+      red: "red",
+      yellow: "yellow",
+      curve: "curve",
+      dest: "arriving",
+      end: "cruise",
+      building: "obstacle",
+    };
+    let intent = map[plan.limit];
+    const slowing = plan.v[4] < this.v - 0.5 || plan.v[8] < 0.5;
+    if (intent === "follow" && !slowing && this.v > 3) intent = "follow";
+    if (!plan.feasible) intent = "emergency";
+    else if (plan.a[1] < -4.5 && (intent === "ped" || intent === "yield" || intent === "bike" || intent === "obstacle")) intent = "emergency";
+    if (ref.destS - plan.s0 < 40 && intent === "cruise") intent = "arriving";
+    this.intent = intent;
+    this.lateral = plan.lateral === "lanechange" ? (plan.avoiding ? "overtake" : "lanechange") : plan.lateral === "nudge" ? "nudge" : "keep";
+    this.message = "";
+    // Turn signal: planned lateral move, else the next manoeuvre on the route.
+    if (Math.abs(plan.dT - plan.d0) > 1.2 && this.lateral !== "nudge") this.blinker = plan.dT > plan.d0 ? 1 : -1;
+    else {
+      const next = ref.spans.find((sp) => sp.s1 > plan.s0 && sp.s0 - plan.s0 < 45);
+      this.blinker = next ? (next.conn.turn === "left" ? -1 : next.conn.turn === "right" ? 1 : 0) : 0;
     }
-    if (this.lcEndS >= 0 && this.pathS > this.lcEndS) {
-      this.lcEndS = -1;
-      this.lcTarget = -1;
-    }
-    const path = this.path as Polyline;
+  }
 
-    // ---- Longitudinal planning -------------------------------------------------
-    const p: IdmParams = { ...IDM_DEFAULT, aMax: 2.4, T: 1.4, s0: 3.2 };
-    const lookahead = clamp(this.v * 4 + 22, 35, 90);
-    const samples: PathSample[] = [];
-    for (let rel = 0.5; rel <= lookahead; rel += 1) {
-      const smp = path.sampleAt(this.pathS + rel);
-      samples.push({ p: smp.p, dir: smp.dir, kappa: smp.kappa, s: rel });
+  private track(dt: number, net: RoadNetwork): void {
+    const plan = this.plan;
+    const path = this.planPath;
+    if (!plan || !path) {
+      this.brake(dt, net, 4);
+      return;
     }
-    const vLimit = SPEED_LIMIT;
-    const vCurve = curvatureSpeed(samples, 0, 2.2, 2.0, vLimit);
-    let a = idmFree(this.v, Math.min(vLimit, vCurve), p);
-    let intent: IntentKind = vCurve < vLimit - 1.5 ? "curve" : "cruise";
+    this.planAge += dt;
+    const tau = this.planAge;
+    const k = Math.min(plan.v.length - 2, Math.floor(tau / PRED_DT));
+    const f = clamp((tau - k * PRED_DT) / PRED_DT, 0, 1);
+    const vRef = plan.v[k] + (plan.v[k + 1] - plan.v[k]) * f;
+    const aRef = plan.a[k] + (plan.a[k + 1] - plan.a[k]) * f;
+    const aCmd = clamp(aRef + 1.4 * (vRef - this.v), -8.5, 3);
+    this.accel = aCmd;
+    this.v = Math.max(0, this.v + aCmd * dt);
+    if (vRef < 0.05 && this.v < 0.3 && aCmd < 0.1) this.v = 0;
+    this.steerTo(path, dt);
+    this.integrate(dt, net);
+  }
+
+  /** Stanley steering at the vehicle centre with curvature feedforward. */
+  private steerTo(path: Polyline, dt: number): void {
+    const pr = path.project(this.pos);
+    const sRef = pr.s + Math.max(this.v, 0) * 0.25;
+    const d1 = path.sampleAt(sRef - 0.8).dir;
+    const d2 = path.sampleAt(sRef + 0.8).dir;
+    const kappa = Math.atan2(cross(d1, d2), dot(d1, d2)) / 1.6;
+    const beta = Math.asin(clamp((kappa * WHEELBASE) / 2, -0.9, 0.9));
+    const ff = Math.atan(2 * Math.tan(beta));
+    const slip = Math.atan(0.5 * Math.tan(this.steer));
+    const headingErr = wrapAngle(angleOf(path.sampleAt(pr.s).dir) - (this.heading + slip));
+    const cmd = clamp(ff + headingErr + Math.atan2(-1.5 * pr.lateral, this.v + 1.5), -MAX_STEER, MAX_STEER);
+    this.steer += clamp(cmd - this.steer, -2.5 * dt, 2.5 * dt);
+  }
+
+  private brake(dt: number, net: RoadNetwork, decel: number): void {
+    this.accel = -decel;
+    this.v = Math.max(0, this.v - decel * dt);
+    this.integrate(dt, net);
+  }
+
+  // ---- Free-space driving ------------------------------------------------------------------------
+
+  private enterFree(net: RoadNetwork, aheadOnly: boolean, agents: readonly Agent[] = this.lastAgents, exclude: Lane | null = null): void {
+    this.freeExclude = exclude;
+    this.fsd = "free";
+    this.plan = null;
+    this.planPath = null;
+    this.ref = null;
+    this.route = null;
+    this.free = null;
+    this.blockedTimer = 0;
+    this.freeAheadOnly = aheadOnly;
+    this.freeReason = aheadOnly ? "blocked" : `unlocalized@${this.pos.x.toFixed(0)},${this.pos.y.toFixed(0)} h=${this.heading.toFixed(2)} v=${this.v.toFixed(1)}`;
+    this.searchFree(net, this.staticObstacles(agents));
+  }
+
+  private searchFree(net: RoadNetwork, obstacles: { p: Vec2; r: number }[]): void {
+    const fwd = this.fwd;
+    const goals: { x: number; y: number; h: number; lane: Lane }[] = [];
+    for (const radius of [45, 110]) {
+      goals.length = 0;
+      const seen = new Set<Lane>();
+      for (const e of net.nearest(this.pos, radius)) {
+        const l = e.lane;
+        if (!l || seen.has(l) || l.poly.length < 8 || !net.core.has(l) || l.road === this.freeExclude?.road) continue;
+        seen.add(l);
+        for (let s = 3; s < l.poly.length - 4; s += 4) {
+          const smp = l.poly.sampleAt(s);
+          if (dist(smp.p, this.pos) > radius) continue;
+          // When going around an obstacle, only poses clearly ahead count as done.
+          if (this.freeAheadOnly && (dot(sub(smp.p, this.pos), fwd) < 12 || obstacles.some((o) => dist(o.p, smp.p) < 5))) continue;
+          goals.push({ x: smp.p.x, y: smp.p.y, h: angleOf(smp.dir), lane: l });
+        }
+      }
+      goals.sort((a, b) => dist(a, this.pos) - dist(b, this.pos));
+      goals.length = Math.min(goals.length, 140);
+      if (goals.length === 0) continue;
+      const res = hybridAStar({
+        start: { x: this.pos.x, y: this.pos.y, h: this.heading },
+        goals,
+        grid: net.grid,
+        obstacles,
+        length: this.length,
+        width: this.width,
+        maxCurvature: MAX_CURVATURE * 0.92,
+        maxExpansions: radius < 50 ? 25000 : 45000,
+      });
+      if (res) {
+        const runs = splitByDirection(res.path).map((r) => ({ poly: new Polyline(r.map((p) => ({ x: p.x, y: p.y }))), dir: r[0].dir }));
+        const goal = goals.find((g) => g.x === res.goal.x && g.y === res.goal.y) ?? null;
+        this.free = { path: res.path, runs, run: 0, goalLane: goal?.lane ?? null };
+        this.fsd = "free";
+        this.message = "";
+        return;
+      }
+    }
+    this.free = null;
+    this.fsd = "blocked";
+    this.message = "暂未找到返回道路的可行路径，稍后重试";
+  }
+
+  private updateFree(dt: number, ctx: DriveContext): void {
+    const { net } = ctx;
+    this.lateral = "keep";
     this.leadId = -1;
-    this.activeStop = null;
-
-    const obs: Obstacle | null = scanPath(samples, ctx.agents, {
-      selfId: this.id,
-      tube: 1.1,
-      pedMargin: 0.9,
-      pedHorizon: 4,
-      selfSpeed: this.v,
-    });
-    let obstructionCar: NpcCar | null = null;
-    if (obs) {
-      const ao = idmAccel(this.v, vLimit, obs.gap, this.v - Math.max(0, obs.speed), p);
-      if (ao < a) {
-        a = ao;
-        this.leadId = obs.agent.id;
-        if (obs.agent.kind === "ped") intent = "ped";
-        else {
-          const car = ctx.traffic.get(obs.agent.id);
-          intent = car && ctx.traffic.isObstruction(car) ? "obstacle" : "follow";
-        }
+    if (this.fsd === "blocked" || !this.free) {
+      this.intent = "searching";
+      this.brake(dt, net, 3);
+      this.blockedTimer += dt;
+      if (this.blockedTimer > 2.5) {
+        this.blockedTimer = 0;
+        this.searchFree(net, this.staticObstacles(ctx.agents));
       }
-      if (obs.agent.kind === "car") {
-        const car = ctx.traffic.get(obs.agent.id);
-        const beforeDest = obs.gap + CAR_HALF_LEN < this.destS - this.pathS;
-        if (car && ctx.traffic.isObstruction(car) && obs.gap < 45 && beforeDest) obstructionCar = car;
-      }
+      return;
     }
-
-    const stop = this.nextStop();
-    let stopAhead: "R" | "Y" | null = null;
-    if (stop) {
-      const gap = stop.s - this.pathS - CAR_HALF_LEN;
-      if (gap < 80 && this.committedStopRi !== stop.ri) {
-        const color = world.signal(stop.node, stop.dirIn, stop.turn, ctx.t);
-        let mustStop = color === "R";
-        if (color === "Y") {
-          const brakeDist = (this.v * this.v) / (2 * 3.2);
-          mustStop = brakeDist < gap - 0.5;
-          if (!mustStop) this.committedStopRi = stop.ri;
-        }
-        if (color === "G" && gap < 2.5) this.committedStopRi = stop.ri;
-        if (gap < 60) this.activeStop = { marker: stop, color };
-        if (mustStop) {
-          if (gap < 60) stopAhead = color === "Y" ? "Y" : "R";
-          const al = idmAccel(this.v, vLimit, gap, this.v, { ...p, s0: 0.9 });
-          if (al < a) {
-            a = al;
-            intent = color === "Y" ? "yellow" : "light";
-            this.leadId = -1;
+    const m = this.free;
+    const run = m.runs[m.run];
+    if (!run) {
+      this.fsd = "lane";
+      return;
+    }
+    const pr = run.poly.project(this.pos);
+    const remaining = run.poly.length - pr.s;
+    // Hand back to lane driving once aligned with a lane in the direction of travel.
+    const lastRun = m.run === m.runs.length - 1;
+    const progressed = !this.freeAheadOnly || pr.s > run.poly.length * 0.65;
+    const loc = net.matchLane(this.pos, this.heading, 1.4, 0.3);
+    if (loc && run.dir > 0 && lastRun && progressed) {
+      this.fsd = "lane";
+      this.free = null;
+      this.routeTimer = 0;
+      this.planTimer = 0;
+      return;
+    }
+    if (remaining < 0.5 && Math.abs(this.v) < 0.25) {
+      m.run++;
+      if (m.run >= m.runs.length) {
+        this.fsd = "lane";
+        this.free = null;
+        this.routeTimer = 0;
+        this.planTimer = 0;
+      }
+      this.v = 0;
+      return;
+    }
+    // Road users on or moving towards the next metres of the manoeuvre make the vehicle wait.
+    let hazard = false;
+    for (const a of ctx.agents) {
+      if (a.id === this.id || dist(a.pos, this.pos) > 25) continue;
+      const still = a.v < 0.3;
+      const margin = still ? 0.15 : 1.2;
+      for (let t = 0; t <= (still ? 0 : 3.5) && !hazard; t += 0.5) {
+        const q = { x: a.pos.x + a.vel.x * t, y: a.pos.y + a.vel.y * t };
+        const circles = still && a.kind === "vehicle" ? footprint(q, a.heading, a.length, a.width) : [q];
+        const ar = a.kind === "ped" ? 0.35 : a.width / 2;
+        for (let s = pr.s; s < Math.min(run.poly.length, pr.s + (still ? 7 : 10)) && !hazard; s += 1) {
+          const own = run.poly.sampleAt(s);
+          for (const c of footprint(own.p, angleOf(own.dir), this.length, this.width)) {
+            if (circles.some((q2) => dist(c, q2) < this.width / 2 + ar + margin)) {
+              hazard = true;
+              break;
+            }
           }
         }
       }
-    }
-
-    const destGap = this.destS - this.pathS;
-    if (destGap < 70) {
-      const ad = idmAccel(this.v, vLimit, Math.max(0.05, destGap), this.v, { ...p, s0: 0.2, T: 0.8 });
-      if (ad < a) {
-        a = ad;
-        intent = "arriving";
+      if (hazard) {
+        this.leadId = a.id;
+        break;
       }
     }
-    if (a < -4.5 && (intent === "ped" || intent === "follow" || intent === "obstacle")) intent = "emergency";
-    if (stopAhead && (intent === "cruise" || intent === "curve" || intent === "follow" || intent === "arriving")) {
-      intent = stopAhead === "Y" ? "yellow" : "light";
+    const vMax = run.dir > 0 ? 2.8 : 1.6;
+    const vTarget = hazard ? 0 : run.dir * Math.min(vMax, Math.sqrt(2 * 0.8 * Math.max(0, remaining - 0.2)) + 0.15);
+    const aCmd = clamp(1.8 * (vTarget - this.v), -4, 1.5);
+    this.accel = aCmd;
+    this.v = clamp(this.v + aCmd * dt, -vMax, vMax);
+    // Pure pursuit in the direction of motion: tan(delta) = 2 L y / Ld^2 holds for both directions.
+    const Ld = 3.2;
+    const target = run.poly.sampleAt(Math.min(run.poly.length, pr.s + Ld)).p;
+    const rel = sub(target, this.pos);
+    const ly = -rel.x * Math.sin(this.heading) + rel.y * Math.cos(this.heading);
+    const dLen = Math.max(1.5, Math.hypot(rel.x, rel.y));
+    const cmd = clamp(Math.atan((2 * WHEELBASE * ly) / (dLen * dLen)), -MAX_STEER, MAX_STEER);
+    this.steer += clamp(cmd - this.steer, -2 * dt, 2 * dt);
+    this.freeHazardTime = hazard && Math.abs(this.v) < 0.2 ? this.freeHazardTime + dt : 0;
+    if (this.freeHazardTime > 4) {
+      this.freeHazardTime = 0;
+      this.searchFree(net, this.staticObstacles(ctx.agents));
+      return;
     }
-
-    a = clamp(a, -9, p.aMax);
-    // Rate-limited acceleration for comfort; hard braking bypasses the filter.
-    this.accel = a < -4 ? a : this.accel + clamp(a - this.accel, -8 * dt, 3.5 * dt);
-    this.v = Math.max(0, this.v + this.accel * dt);
-    if (this.v < 0.05 && this.accel < 0) this.v = 0;
-
-    const blockedNearDest = obs !== null && obs.gap + CAR_HALF_LEN < destGap && destGap < 10;
-    if ((Math.abs(destGap) < 2.5 || blockedNearDest) && this.v < 0.3) {
-      this.arrived = true;
-      intent = "arrived";
+    this.intent = hazard ? "yield" : run.dir < 0 ? "reverse" : "freespace";
+    this.blinker = hazard ? 0 : 2;
+    this.integrate(dt, net);
+    if (this.bumped) {
+      this.fsd = "blocked";
+      this.blockedTimer = 2;
     }
-
-    // ---- Lane-change behaviour ------------------------------------------------
-    const cur = this.route[this.routeIdx];
-    this.lcCooldown = Math.max(0, this.lcCooldown - dt);
-    if (this.lcEndS >= 0) {
-      this.lcBlockedTime = this.v < 0.2 ? this.lcBlockedTime + dt : 0;
-      if (this.lcBlockedTime > 4) {
-        // The merge is blocked; return to the original lane and retry later.
-        this.lane = this.lcFrom;
-        this.rebuildPath(world, null);
-        this.lcBlockedTime = 0;
-        this.lcCooldown = 5;
-      }
-    }
-    if (cur && kind === PATH_KIND_EDGE && this.lcEndS < 0 && !this.arrived && this.lcCooldown <= 0) {
-      const u = world.edgeCoord(cur, this.pos);
-      const remaining = cur.length - u;
-      const L = clamp(this.v * 2.6, 9, 30);
-      const next = this.route[this.routeIdx + 1];
-      const need = next ? requiredLane(turnOf(cur.dir, next.dir) as Turn) : null;
-      let want: number | null = null;
-      let waiting = false;
-      if (need !== null && need !== this.lane && remaining > L + 3) {
-        want = need;
-        waiting = true;
-      } else if (obstructionCar && remaining > L + 6) {
-        want = 1 - this.lane;
-      }
-      if (want !== null) {
-        if (this.laneFree(ctx, cur, want, u)) {
-          this.rebuildPath(world, want);
-          intent = "lanechange";
-        } else if (waiting && (intent === "cruise" || intent === "follow")) {
-          intent = "waitlane";
-        }
-      }
-    }
-    if (this.lcEndS >= 0 && intent === "cruise") intent = "lanechange";
-
-    // ---- Lateral control: Stanley at the vehicle centre with curvature feedforward ----
-    const activePath = this.path as Polyline;
-    const cp = activePath.project(this.pos, this.pathIdx, 30);
-    const sRef = cp.s + this.v * 0.25;
-    const d1 = activePath.sampleAt(sRef - 1).dir;
-    const d2 = activePath.sampleAt(sRef + 1).dir;
-    const kappa = Math.atan2(cross(d1, d2), dot(d1, d2)) / 2;
-    const beta = Math.asin(clamp((kappa * WHEELBASE) / 2, -0.9, 0.9));
-    const steerFF = Math.atan(2 * Math.tan(beta));
-    const pathHeading = angleOf(activePath.sampleAt(cp.s).dir);
-    const slip = Math.atan(0.5 * Math.tan(this.steer));
-    const headingErr = wrapAngle(pathHeading - (this.heading + slip));
-    const steerCmd = clamp(steerFF + headingErr + Math.atan2(-1.6 * cp.lateral, this.v + 1.5), -MAX_STEER, MAX_STEER);
-    this.steer += clamp(steerCmd - this.steer, -2.5 * dt, 2.5 * dt);
-    this.integrate(dt);
-
-    // ---- Signals ------------------------------------------------------------
-    let blink = 0;
-    if (this.lcEndS >= 0) blink = this.lcTarget === 1 ? -1 : 1;
-    else if (kind === PATH_KIND_CONN) {
-      const turn = this.stops.find((m) => m.ri === ri)?.turn;
-      blink = turn === "left" ? -1 : turn === "right" ? 1 : 0;
-    } else if (stop && stop.s - this.pathS < 45) blink = stop.turn === "left" ? -1 : stop.turn === "right" ? 1 : 0;
-    this.blinker = blink;
-    this.intent = intent;
   }
 
-  /** Remaining route distance and the next manoeuvre, for the navigation card. */
-  navInfo(): { turn: Turn | "arrive"; distance: number; remaining: number } | null {
-    if (this.mode !== "fsd" || !this.path) return null;
-    const stop = this.nextStop();
-    const remaining = Math.max(0, this.destS - this.pathS);
-    if (!stop) return { turn: "arrive", distance: remaining, remaining };
-    return { turn: stop.turn, distance: Math.max(0, stop.s - this.pathS), remaining };
+  /**
+   * Whether a stationary road user appears parked rather than queued, from observable cues only:
+   * hazard lights, a vehicle stopped directly in front of it, or a red signal just ahead of it.
+   */
+  private looksParked(a: Agent, ctx: DriveContext): boolean {
+    if (a.kind !== "vehicle") return false;
+    if (a.blinker === 2 || a.vkind === "bike") return true;
+    const f = fromAngle(a.heading);
+    for (const b of ctx.agents) {
+      if (b === a || b.id === this.id || b.kind !== "vehicle" || b.v > 1) continue;
+      const rel = sub(b.pos, a.pos);
+      const along = dot(rel, f);
+      const lat = Math.abs(cross(f, rel));
+      if (along > 0 && along < (a.length + b.length) / 2 + 7 && lat < 2) return false;
+    }
+    const m = ctx.net.matchLane(a.pos, a.heading, 2.6, 0.6);
+    if (m && m.lane.poly.length - m.s < 25) {
+      const sig = ctx.net.laneSignal(m.lane, ctx.t);
+      if (sig === "R" || sig === "Y") return false;
+      // Waiting to enter a junction (giving way) also counts as queued.
+      if (m.lane.out.some((c) => c.conflicts.length > 0) && m.lane.poly.length - m.s < 8) return false;
+    }
+    return true;
   }
 
-  /** Current heading of the reference path, used to orient the path ribbon. */
-  pathHeadingAt(s: number): number {
-    if (!this.path) return this.heading;
-    return angleOf(this.path.sampleAt(s).dir);
+  private staticObstacles(agents: readonly Agent[]): { p: Vec2; r: number }[] {
+    const out: { p: Vec2; r: number }[] = [];
+    for (const a of agents) {
+      if (a.id === this.id || a.v > 0.3 || dist(a.pos, this.pos) > 70) continue;
+      for (const c of a.kind === "ped" ? [a.pos] : footprint(a.pos, a.heading, a.length, a.width)) out.push({ p: c, r: a.kind === "ped" ? 0.4 : a.width / 2 });
+    }
+    return out;
+  }
+
+  /** Next manoeuvre on the route and remaining distance, for the navigation card. */
+  navInfo(): { turn: "straight" | "left" | "right" | "uturn" | "arrive"; distance: number; remaining: number } | null {
+    if (this.mode !== "fsd" || !this.ref || !this.plan) return null;
+    const s0 = this.plan.s0;
+    const remaining = Math.max(0, this.ref.destS - s0);
+    const next = this.ref.spans.find((sp) => sp.s1 > s0 && sp.conn.turn !== "straight");
+    if (!next || next.s0 - s0 > remaining) return { turn: "arrive", distance: remaining, remaining };
+    return { turn: next.conn.turn, distance: Math.max(0, next.s0 - s0), remaining };
   }
 }

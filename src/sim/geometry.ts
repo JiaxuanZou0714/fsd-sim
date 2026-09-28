@@ -186,6 +186,101 @@ function computeCurvature(pts: Vec2[], cum: number[]): number[] {
   return out;
 }
 
+/** Resamples a polyline at (approximately) uniform spacing, keeping both endpoints. */
+export function resample(points: Vec2[], spacing: number): Vec2[] {
+  const poly = new Polyline(points);
+  const n = Math.max(1, Math.round(poly.length / spacing));
+  const out: Vec2[] = [];
+  for (let i = 0; i <= n; i++) out.push(poly.sampleAt((poly.length * i) / n).p);
+  return out;
+}
+
+/** Moving-average smoothing with fixed endpoints. */
+export function smooth(points: Vec2[], radius: number, passes: number): Vec2[] {
+  let cur = points;
+  for (let pass = 0; pass < passes; pass++) {
+    const next: Vec2[] = [];
+    for (let i = 0; i < cur.length; i++) {
+      if (i === 0 || i === cur.length - 1) {
+        next.push(cur[i]);
+        continue;
+      }
+      const r = Math.min(radius, i, cur.length - 1 - i);
+      let sx = 0;
+      let sy = 0;
+      for (let k = -r; k <= r; k++) {
+        sx += cur[i + k].x;
+        sy += cur[i + k].y;
+      }
+      next.push({ x: sx / (2 * r + 1), y: sy / (2 * r + 1) });
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+/** Offsets a polyline to the right by `offset` using per-vertex averaged normals. */
+export function offsetPolyline(points: Vec2[], offset: number): Vec2[] {
+  const n = points.length;
+  const out: Vec2[] = [];
+  for (let i = 0; i < n; i++) {
+    const a = points[Math.max(0, i - 1)];
+    const b = points[Math.min(n - 1, i + 1)];
+    const t = norm(sub(b, a));
+    out.push(add(points[i], scale(right(t), offset)));
+  }
+  return out;
+}
+
+/** Sub-polyline between arc lengths s0 and s1. */
+export function slicePolyline(poly: Polyline, s0: number, s1: number, spacing = 1): Vec2[] {
+  const a = clamp(s0, 0, poly.length);
+  const b = clamp(s1, a, poly.length);
+  const out: Vec2[] = [poly.sampleAt(a).p];
+  const i0 = poly.segmentAt(a) + 1;
+  for (let i = i0; i < poly.pts.length && poly.cum[i] < b; i++) {
+    if (poly.cum[i] > a + 1e-3) out.push(poly.pts[i]);
+  }
+  out.push(poly.sampleAt(b).p);
+  return spacing > 0 ? resample(out, spacing) : out;
+}
+
+export function pointInPolygon(p: Vec2, poly: readonly Vec2[]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i];
+    const b = poly[j];
+    if (a.y > p.y !== b.y > p.y && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+
+export function convexHull(points: readonly Vec2[]): Vec2[] {
+  const pts = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+  if (pts.length < 3) return pts;
+  const crossO = (o: Vec2, a: Vec2, b: Vec2): number => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lower: Vec2[] = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && crossO(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper: Vec2[] = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (upper.length >= 2 && crossO(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  upper.pop();
+  lower.pop();
+  return lower.concat(upper);
+}
+
+export function polygonArea(poly: readonly Vec2[]): number {
+  let a = 0;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) a += poly[j].x * poly[i].y - poly[i].x * poly[j].y;
+  return a / 2;
+}
+
 /** Deterministic PRNG so headless tests are reproducible. */
 export class Rng {
   private state: number;
